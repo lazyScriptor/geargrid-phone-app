@@ -57,7 +57,7 @@ class GearGridCallScreeningService : CallScreeningService() {
 
             val localBrief = phoneE164?.let { briefDao.findBriefByPhone(it) }
             val localContact = if (localBrief == null && phoneE164 != null) {
-                briefDao.findContactByPhone(it)
+                briefDao.findContactByPhone(phoneE164)
             } else {
                 null
             }
