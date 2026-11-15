@@ -287,6 +287,7 @@ class PhoneAssistantPlugin : Plugin() {
             put("contactSyncEnabled", store.isContactSyncEnabled())
             put("contactsConsented", store.hasContactsConsent())
             put("contactsSyncedAt", store.getContactsSyncedAt())
+            put("contactsSyncError", store.getContactsSyncError())
             put("briefsSyncedAt", store.getBriefsSyncedAt())
             put("manufacturer", Build.MANUFACTURER ?: "Android")
         }

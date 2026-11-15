@@ -40,6 +40,7 @@ class CredentialStore(context: Context) {
             .remove(KEY_CONTACT_SYNC_ENABLED)
             .remove(KEY_CONTACTS_CONSENTED)
             .remove(KEY_CONTACTS_SYNCED_AT)
+            .remove(KEY_CONTACTS_SYNC_ERROR)
             .remove(KEY_BRIEFS_SYNCED_AT)
             .remove(KEY_BRIEFS_SINCE_CURSOR)
             .remove(KEY_PUSH_TOKEN)
@@ -70,6 +71,14 @@ class CredentialStore(context: Context) {
     fun getContactsSyncedAt(): String? = prefs.getString(KEY_CONTACTS_SYNCED_AT, null)
     fun setContactsSyncedAt(iso: String) {
         prefs.edit().putString(KEY_CONTACTS_SYNCED_AT, iso).apply()
+    }
+
+    /** Why the last contact sync failed (a short code the web app translates), or null after a success. */
+    fun getContactsSyncError(): String? = prefs.getString(KEY_CONTACTS_SYNC_ERROR, null)
+    fun setContactsSyncError(code: String?) {
+        prefs.edit().apply {
+            if (code == null) remove(KEY_CONTACTS_SYNC_ERROR) else putString(KEY_CONTACTS_SYNC_ERROR, code)
+        }.apply()
     }
 
     fun getBriefsSyncedAt(): String? = prefs.getString(KEY_BRIEFS_SYNCED_AT, null)
@@ -109,6 +118,7 @@ class CredentialStore(context: Context) {
         private const val KEY_CONTACT_SYNC_ENABLED = "contact_sync_enabled"
         private const val KEY_CONTACTS_CONSENTED = "contacts_consented"
         private const val KEY_CONTACTS_SYNCED_AT = "contacts_synced_at"
+        private const val KEY_CONTACTS_SYNC_ERROR = "contacts_sync_error"
         private const val KEY_BRIEFS_SYNCED_AT = "briefs_synced_at"
         private const val KEY_BRIEFS_SINCE_CURSOR = "briefs_since_cursor"
         private const val KEY_PUSH_TOKEN = "push_token"

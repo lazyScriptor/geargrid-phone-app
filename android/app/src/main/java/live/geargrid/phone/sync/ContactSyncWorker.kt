@@ -26,6 +26,7 @@ import live.geargrid.phone.db.OutboxEntity
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 
 class ContactSyncWorker(
@@ -42,7 +43,11 @@ class ContactSyncWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val store = CredentialStore(applicationContext)
-        if (!store.hasCredentials() || !store.isContactSyncEnabled() || !store.hasContactsConsent()) {
+        if (!store.isContactSyncEnabled() || !store.hasContactsConsent()) {
+            return@withContext Result.success()
+        }
+        if (!store.hasCredentials()) {
+            store.setContactsSyncError(ERROR_NOT_PAIRED)
             return@withContext Result.success()
         }
 
@@ -51,6 +56,7 @@ class ContactSyncWorker(
             Manifest.permission.READ_CONTACTS
         ) == PackageManager.PERMISSION_GRANTED
         if (!hasPermission) {
+            store.setContactsSyncError(ERROR_NO_PERMISSION)
             return@withContext Result.success()
         }
 
@@ -73,6 +79,9 @@ class ContactSyncWorker(
             .filter { !scanned.containsKey(it) }
 
         if (!isInitialFullSync && upserts.isEmpty() && deletedKeys.isEmpty()) {
+            // Nothing changed, but the check succeeded: record it so "Sync now" shows a result.
+            store.setContactsSyncError(null)
+            store.setContactsSyncedAt(Instant.now().toString())
             return@withContext Result.success()
         }
 
@@ -109,6 +118,7 @@ class ContactSyncWorker(
                         lastServerTime = serverTime
                     }
                 } catch (e: DeviceApiClient.HttpException) {
+                    store.setContactsSyncError(errorCodeFor(e.code))
                     if (e.code == 401 || e.code == 403 || e.code == 409) {
                         return@withContext Result.failure()
                     }
@@ -124,6 +134,7 @@ class ContactSyncWorker(
                 }
             }
         } catch (e: Exception) {
+            store.setContactsSyncError(ERROR_NETWORK)
             return@withContext Result.retry()
         }
 
@@ -147,7 +158,8 @@ class ContactSyncWorker(
             }
         }
 
-        lastServerTime?.let { store.setContactsSyncedAt(it) }
+        store.setContactsSyncError(null)
+        store.setContactsSyncedAt(lastServerTime ?: Instant.now().toString())
         OutboxWorker.enqueueOneShot(applicationContext)
         Result.success()
     }
@@ -217,6 +229,13 @@ class ContactSyncWorker(
         return if (raw.length <= MAX_KEY_LENGTH) raw else "lk:" + sha256(raw).take(40)
     }
 
+    private fun errorCodeFor(httpCode: Int): String = when {
+        httpCode == 401 -> ERROR_UNAUTHORIZED
+        httpCode == 403 -> ERROR_FORBIDDEN
+        httpCode in 400..499 -> ERROR_REJECTED
+        else -> ERROR_SERVER
+    }
+
     private fun sha256(input: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(input.toByteArray(Charsets.UTF_8))
         return digest.joinToString("") { "%02x".format(it) }
@@ -230,6 +249,15 @@ class ContactSyncWorker(
         private const val MAX_NAME_LENGTH = 255
         private const val MAX_PHONE_LENGTH = 50
         private const val MAX_PHONES_PER_CONTACT = 20
+
+        // Reported to the web app as contactsSyncError; it translates each code.
+        const val ERROR_NOT_PAIRED = "not_paired"
+        const val ERROR_NO_PERMISSION = "no_permission"
+        const val ERROR_UNAUTHORIZED = "unauthorized"
+        const val ERROR_FORBIDDEN = "forbidden"
+        const val ERROR_REJECTED = "rejected"
+        const val ERROR_SERVER = "server"
+        const val ERROR_NETWORK = "network"
         private const val UNIQUE_PERIODIC = "geargrid_contact_sync_periodic"
         private const val UNIQUE_ONESHOT = "geargrid_contact_sync_oneshot"
 
