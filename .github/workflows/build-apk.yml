@@ -1,0 +1,61 @@
+name: Build debug APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Install Capacitor
+        run: npm install
+
+      # The app loads app.geargrid.live, so the bundled web folder only needs a placeholder page.
+      - name: Create placeholder web assets
+        run: |
+          mkdir -p dist
+          echo '<!doctype html><title>GearGrid Phone</title>' > dist/index.html
+
+      - name: Sync Capacitor into the Android project
+        run: npx cap sync android
+
+      # google-services.json is stored base64-encoded in the GOOGLE_SERVICES_JSON_B64 repo secret.
+      - name: Add Firebase config
+        env:
+          GOOGLE_SERVICES_JSON_B64: ${{ secrets.GOOGLE_SERVICES_JSON_B64 }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON_B64" ]; then
+            echo "$GOOGLE_SERVICES_JSON_B64" | base64 -d > android/app/google-services.json
+          else
+            echo "::warning::GOOGLE_SERVICES_JSON_B64 is not set, so this APK has no push notifications."
+          fi
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geargrid-phone-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
