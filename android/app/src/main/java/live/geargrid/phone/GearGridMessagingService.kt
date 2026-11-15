@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import com.google.firebase.messaging.FirebaseMessagingService
@@ -52,14 +53,72 @@ class GearGridMessagingService : FirebaseMessagingService() {
         ensureNotificationChannels(applicationContext)
 
         val data = message.data
+        val type = data["type"].orEmpty()
+        if (type == "device_revoked") {
+            RevocationHandler.wipe(applicationContext, keepCredentials = false)
+            return
+        }
+        if (type == "device_suspended") {
+            CredentialStore(applicationContext).setDeviceStatus("SUSPENDED")
+            RevocationHandler.signOutFullApp(applicationContext)
+            RevocationHandler.wipe(applicationContext, keepCredentials = true)
+            return
+        }
+        if (type == "wipe_cache") {
+            RevocationHandler.wipe(applicationContext, keepCredentials = true)
+            return
+        }
+        if (type == "device_resumed" || type == "device_approved") {
+            CredentialStore(applicationContext).setDeviceStatus("ACTIVE")
+            live.geargrid.phone.sync.BriefSyncWorker.enqueueOneShot(applicationContext)
+            return
+        }
+        if (type == "sample_call") {
+            live.geargrid.phone.call.CallerOverlayManager.showSample(applicationContext)
+            return
+        }
+        if (type == "policy_changed") {
+            live.geargrid.phone.sync.BriefSyncWorker.enqueueOneShot(applicationContext)
+            return
+        }
+        if (type == "dial") {
+            val phone = data["phone"]?.trim().orEmpty()
+                .ifEmpty { data["phone_e164"]?.trim()?.let { "+$it" }.orEmpty() }
+            if (phone.isNotEmpty()) {
+                val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { applicationContext.startActivity(dialIntent) }
+
+                val smallIcon = applicationInfo.icon.takeIf { it != 0 }
+                    ?: android.R.drawable.sym_call_outgoing
+                val dialPending = PendingIntent.getActivity(
+                    applicationContext,
+                    (System.currentTimeMillis() and 0x7fffffff).toInt(),
+                    dialIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                val dialNotif = NotificationCompat.Builder(applicationContext, CHANNEL_CALLS)
+                    .setSmallIcon(smallIcon)
+                    .setContentTitle("Click to call")
+                    .setContentText("Tap to dial $phone")
+                    .setAutoCancel(true)
+                    .setContentIntent(dialPending)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .build()
+                val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                manager?.notify(9102, dialNotif)
+            }
+            return
+        }
+
         val title = message.notification?.title
-            ?: data["title"]
+            ?: data["title"]?.takeIf { it.isNotBlank() }
             ?: getString(R.string.app_name)
         val body = message.notification?.body
-            ?: data["body"]
+            ?: data["body"]?.takeIf { it.isNotBlank() }
             ?: return
         val silent = data["silent"] == "true"
-        val type = data["type"].orEmpty()
         val invoiceId = data["invoice_id"].orEmpty()
 
         val launchIntent = Intent(applicationContext, MainActivity::class.java).apply {
@@ -79,7 +138,11 @@ class GearGridMessagingService : FirebaseMessagingService() {
         val smallIcon = applicationInfo.icon.takeIf { it != 0 }
             ?: android.R.drawable.ic_dialog_info
 
-        val channelId = if (silent) CHANNEL_BILLS_SILENT else CHANNEL_BILLS
+        val channelId = if (silent) {
+            CHANNEL_BILLS_SILENT
+        } else {
+            data["channel"]?.takeIf { it in KNOWN_ALERT_CHANNELS } ?: CHANNEL_BILLS
+        }
         val builder = NotificationCompat.Builder(applicationContext, channelId)
             .setSmallIcon(smallIcon)
             .setContentTitle(title)
@@ -93,6 +156,9 @@ class GearGridMessagingService : FirebaseMessagingService() {
                 else NotificationCompat.PRIORITY_HIGH
             )
 
+        runCatching {
+            AlertStore.add(CredentialStore(applicationContext), title, body, channelId, type.ifBlank { null }, invoiceId.ifBlank { null })
+        }
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return
         val notificationId = invoiceId.toIntOrNull() ?: (System.currentTimeMillis() % 100_000L).toInt()
@@ -101,31 +167,53 @@ class GearGridMessagingService : FirebaseMessagingService() {
 
     companion object {
         const val CHANNEL_BILLS = "bills"
+        const val CHANNEL_PAYMENTS = "payments"
+        const val CHANNEL_RETURNS = "returns"
+        const val CHANNEL_ALERTS = "alerts"
+        const val CHANNEL_APPROVALS = "approvals"
+        const val CHANNEL_DIGEST = "digest"
         const val CHANNEL_BILLS_SILENT = "bills_silent"
         const val CHANNEL_CALLS = "calls"
         const val EXTRA_PUSH_TYPE = "type"
         const val EXTRA_INVOICE_ID = "invoice_id"
+
+        private val KNOWN_ALERT_CHANNELS = setOf(
+            CHANNEL_BILLS,
+            CHANNEL_PAYMENTS,
+            CHANNEL_RETURNS,
+            CHANNEL_ALERTS,
+            CHANNEL_APPROVALS,
+            CHANNEL_DIGEST,
+            CHANNEL_BILLS_SILENT
+        )
 
         fun ensureNotificationChannels(context: Context) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 ?: return
 
-            val billsChannel = NotificationChannel(
-                CHANNEL_BILLS,
-                "Rental Bills & Payments",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Real-time alerts for new invoices, payments, returns, and contact events."
-                enableVibration(true)
+            val highChannels = listOf(
+                Triple(CHANNEL_BILLS, "Bills", "Alerts when bills are created or updated."),
+                Triple(CHANNEL_PAYMENTS, "Payments", "Alerts when payments are recorded."),
+                Triple(CHANNEL_RETURNS, "Returns", "Alerts when equipment returns are processed."),
+                Triple(CHANNEL_ALERTS, "Alerts", "Voids, deletions, contact reuse, and blacklisting alerts."),
+                Triple(CHANNEL_APPROVALS, "Approvals", "Approval requests requiring administrator decision."),
+                Triple(CHANNEL_DIGEST, "Summaries & Digests", "Batched event digests and daily shop summaries.")
+            )
+            for ((id, name, desc) in highChannels) {
+                val ch = NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH).apply {
+                    description = desc
+                    enableVibration(true)
+                }
+                manager.createNotificationChannel(ch)
             }
 
             val silentChannel = NotificationChannel(
                 CHANNEL_BILLS_SILENT,
-                "Rental Bills (Quiet Hours)",
+                "Quiet Hours (Silent)",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Silent push alerts delivered during shop quiet hours."
+                description = "Silent push alerts delivered during shop or personal quiet hours."
                 setSound(null, null)
                 enableVibration(false)
             }
@@ -140,7 +228,6 @@ class GearGridMessagingService : FirebaseMessagingService() {
                 setSound(null, null)
             }
 
-            manager.createNotificationChannel(billsChannel)
             manager.createNotificationChannel(silentChannel)
             manager.createNotificationChannel(callsChannel)
         }

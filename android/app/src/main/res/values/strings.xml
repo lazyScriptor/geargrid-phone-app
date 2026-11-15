@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">GearGrid Phone</string>
+    <string name="exit_confirm">Leave GearGrid Phone?</string>
+    <string name="exit_yes">Leave</string>
+    <string name="exit_no">Stay</string>
 </resources>

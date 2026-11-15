@@ -36,12 +36,57 @@ class BriefSyncWorker(
 
         val api = DeviceApiClient(store)
         val briefDao = AppDatabase.getInstance(applicationContext).briefDao()
-        val since = store.getBriefsSinceCursor()
 
         var cursor: Long? = null
         var lastServerTime: String? = null
+        var totalUpdated = 0
 
         try {
+            api.checkOfflineWipe()
+            api.rotateTokenIfNeeded()
+            runCatching {
+                val policyData = api.get("/device/policy").optJSONObject("data")
+                if (policyData != null) {
+                    store.setDevicePolicyJson(policyData.toString())
+                    policyData.optString("device_status", "").takeIf { it.isNotBlank() }?.let {
+                        store.setDeviceStatus(it)
+                    }
+                    val wipeDays = policyData.optInt("offline_wipe_days", 0)
+                    if (wipeDays > 0) store.setOfflineWipeDays(wipeDays)
+                    policyData.optJSONObject("effective_capabilities")?.let {
+                        store.setEffectiveCapabilitiesJson(it.toString())
+                    }
+                    policyData.optJSONObject("capability_reasons")?.let {
+                        store.setCapabilityReasonsJson(it.toString())
+                    }
+                    policyData.optString("contact_sync_mode", "").takeIf { it.isNotBlank() }?.let {
+                        store.setContactSyncMode(it)
+                    }
+                    policyData.optString("call_logging_scope", "").takeIf { it.isNotBlank() }?.let {
+                        store.setCallLoggingScope(it)
+                    }
+                    store.setSimFilter(policyData.optNullableString("sim_filter"))
+                    policyData.optJSONObject("after_call_card")?.let { afterCall ->
+                        store.setAfterCallCardEnabled(afterCall.optBoolean("enabled", true))
+                        store.setAfterCallDismissSeconds(afterCall.optInt("auto_dismiss_seconds", 25))
+                        afterCall.optJSONArray("tags")?.let { tagsArr ->
+                            val list = (0 until tagsArr.length())
+                                .mapNotNull { i -> tagsArr.optString(i, "").trim().takeIf { it.isNotEmpty() } }
+                            if (list.isNotEmpty()) {
+                                store.setAfterCallTags(list)
+                            }
+                        }
+                    }
+                    policyData.optString("min_app_version", "").trim().takeIf { it.isNotEmpty() }?.let {
+                        store.setMinAppVersion(it)
+                    }
+                    policyData.optString("latest_app_version", "").trim().takeIf { it.isNotEmpty() }?.let {
+                        store.setLatestAppVersion(it)
+                    }
+                }
+            }
+            val since = store.getBriefsSinceCursor()
+
             do {
                 val currentCursor = cursor
                 val query = buildString {
@@ -91,7 +136,10 @@ class BriefSyncWorker(
                             lastPaymentJson = lastPaymentJson,
                             lastReviewComment = obj.optNullableString("last_review_comment"),
                             summaryLine = obj.optString("summary_line", ""),
-                            updatedAt = obj.optString("updated_at", "")
+                            updatedAt = obj.optString("updated_at", ""),
+                            syncedAt = data.optString("server_time", java.time.Instant.now().toString()),
+                            hasDues = obj.optBoolean("has_dues", false),
+                            nicNumber = obj.optNullableString("nic_number")
                         )
                     )
 
@@ -116,6 +164,7 @@ class BriefSyncWorker(
                 }
                 if (briefEntities.isNotEmpty()) {
                     briefDao.upsertBriefs(briefEntities)
+                    totalUpdated += briefEntities.size
                 }
                 if (phoneEntities.isNotEmpty()) {
                     briefDao.upsertBriefPhones(phoneEntities)
@@ -147,17 +196,43 @@ class BriefSyncWorker(
                 store.setBriefsSinceCursor(lastServerTime)
                 store.setBriefsSyncedAt(lastServerTime)
             }
+            store.setLastSyncSuccessMs(System.currentTimeMillis())
+            store.setLastSyncResult(true, totalUpdated, null)
+            reportSyncState(store, api)
             return@withContext Result.success()
         } catch (e: DeviceApiClient.HttpException) {
+            store.setLastSyncResult(false, null, "http_${e.code}")
             return@withContext if (e.code == 401 || e.code == 403 || e.code == 409) {
                 Result.failure()
             } else {
                 Result.retry()
             }
         } catch (_: IOException) {
+            store.setLastSyncResult(false, null, "no_connection")
             return@withContext Result.retry()
         } catch (_: Exception) {
+            store.setLastSyncResult(false, null, "failed")
             return@withContext Result.retry()
+        }
+    }
+
+    /** Tells the shop's phone list how fresh this phone is (last syncs, customers cached, queued uploads). */
+    private suspend fun reportSyncState(store: CredentialStore, api: DeviceApiClient) {
+        runCatching {
+            val db = AppDatabase.getInstance(applicationContext)
+            val version = runCatching {
+                applicationContext.packageManager.getPackageInfo(applicationContext.packageName, 0).versionName
+            }.getOrNull() ?: "1.0.0"
+            val body = JSONObject().apply {
+                put("app_version", version)
+                put("brief_format", 2)
+                put("cached_briefs", db.briefDao().countBriefs())
+                put("outbox_pending", db.contactSyncDao().countOutbox())
+                store.getBriefsSyncedAt()?.let { put("last_brief_sync_at", it) }
+                store.getContactsSyncedAt()?.let { put("last_contact_sync_at", it) }
+                put("reported_state", JSONObject().apply { put("call_screen_unsupported", store.isCallScreenUnsupported()) })
+            }
+            api.post("/device/register", body)
         }
     }
 

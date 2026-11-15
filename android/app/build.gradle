@@ -48,6 +48,13 @@ android {
         }
     }
 
+    sourceSets {
+        main {
+            // callScreenTokens.json is copied here by scripts/vendor-contracts.sh (shared with the web designer).
+            assets.srcDirs += ['src/main/shared-assets']
+        }
+    }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -67,6 +74,9 @@ dependencies {
     if (findProject(':capacitor-android') != null) {
         implementation project(':capacitor-android')
     }
+
+    // Phone fingerprint / face / PIN prompt for the app lock
+    implementation 'androidx.biometric:biometric:1.1.0'
 
     // Encrypted credential storage
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
@@ -88,6 +98,7 @@ dependencies {
     implementation 'com.google.firebase:firebase-messaging'
 
     testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
 }
 
 // Product owner drops google-services.json here for FCM push builds (Slice B)

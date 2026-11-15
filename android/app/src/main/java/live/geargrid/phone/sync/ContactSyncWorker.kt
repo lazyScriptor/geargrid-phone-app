@@ -43,7 +43,8 @@ class ContactSyncWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val store = CredentialStore(applicationContext)
-        if (!store.isContactSyncEnabled() || !store.hasContactsConsent()) {
+        val syncMode = store.getContactSyncMode()
+        if (syncMode == "off" || (!store.isContactSyncEnabled() && syncMode == "all") || !store.hasContactsConsent()) {
             return@withContext Result.success()
         }
         if (!store.hasCredentials()) {
@@ -64,8 +65,22 @@ class ContactSyncWorker(
         val dao = db.contactSyncDao()
         val api = DeviceApiClient(store)
 
-        val scanned = scanDeviceContacts()
+        val scanned = try {
+            scanDeviceContacts(store, syncMode)
+        } catch (_: IllegalStateException) {
+            store.setContactsSyncError(ERROR_SCAN_FAILED)
+            return@withContext Result.retry()
+        }
         val previousStates = dao.getAllState()
+        val excludedKeys = store.getExcludedContactKeys()
+        val isFilteredMode = syncMode == "selected_labels" ||
+            syncMode == "selected_accounts" ||
+            excludedKeys.isNotEmpty()
+        if (scanned.isEmpty() && previousStates.isNotEmpty() && !isFilteredMode) {
+            store.setContactsSyncError(ERROR_EMPTY_SCAN)
+            return@withContext Result.failure()
+        }
+        val shouldConfirmEmpty = scanned.isEmpty() && previousStates.isNotEmpty() && isFilteredMode
         val previousByKey = previousStates.associateBy { it.contactKey }
         val isInitialFullSync = previousStates.isEmpty()
 
@@ -105,6 +120,9 @@ class ContactSyncWorker(
                         }
                     })
                     put("deletes", if (idx == 0) JSONArray(deletedKeys) else JSONArray())
+                    if (shouldConfirmEmpty && isLast) {
+                        put("confirm_empty", true)
+                    }
                     if (isInitialFullSync && isLast) {
                         put("seen_keys", JSONArray(seenKeys))
                     }
@@ -166,10 +184,13 @@ class ContactSyncWorker(
 
     /**
      * Strict privacy boundary: queries ONLY contact key, display name, and phone number
-     * from ContactsContract.CommonDataKinds.Phone. Photos, emails, addresses, and notes
-     * are never read or transmitted.
+     * from ContactsContract.CommonDataKinds.Phone, optionally narrowed by label/account mode
+     * and explicit user exclusions. Photos, emails, addresses, and notes are never read or transmitted.
      */
-    private fun scanDeviceContacts(): Map<String, ScannedContact> {
+    private fun scanDeviceContacts(store: CredentialStore, syncMode: String): Map<String, ScannedContact> {
+        val allowedContactIds = resolveAllowedContactIds(store, syncMode)
+        val excludedKeys = store.getExcludedContactKeys()
+
         val grouped = linkedMapOf<String, Pair<String, LinkedHashSet<String>>>()
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
@@ -178,25 +199,29 @@ class ContactSyncWorker(
             ContactsContract.CommonDataKinds.Phone.NUMBER
         )
 
-        applicationContext.contentResolver.query(
+        val cursor = applicationContext.contentResolver.query(
             ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
             projection,
             null,
             null,
             ContactsContract.CommonDataKinds.Phone.CONTACT_ID + " ASC"
-        )?.use { cursor ->
-            val idIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
-            val lookupIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.LOOKUP_KEY)
-            val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
-            val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        ) ?: throw IllegalStateException("Contacts cursor unavailable")
 
-            while (cursor.moveToNext()) {
-                val contactId = if (idIdx >= 0) cursor.getLong(idIdx) else continue
-                val lookup = if (lookupIdx >= 0) cursor.getString(lookupIdx) else null
+        cursor.use { c ->
+            val idIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.CONTACT_ID)
+            val lookupIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.LOOKUP_KEY)
+            val nameIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
+            val numIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+
+            while (c.moveToNext()) {
+                val contactId = if (idIdx >= 0) c.getLong(idIdx) else continue
+                if (allowedContactIds != null && !allowedContactIds.contains(contactId)) continue
+                val lookup = if (lookupIdx >= 0) c.getString(lookupIdx) else null
                 val key = contactKeyFor(lookup, contactId)
-                val name = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)?.trim().orEmpty()
+                if (excludedKeys.contains(key)) continue
+                val name = (if (nameIdx >= 0) c.getString(nameIdx) else null)?.trim().orEmpty()
                     .take(MAX_NAME_LENGTH)
-                val rawNum = (if (numIdx >= 0) cursor.getString(numIdx) else null)?.trim().orEmpty()
+                val rawNum = (if (numIdx >= 0) c.getString(numIdx) else null)?.trim().orEmpty()
                 if (name.isEmpty() || rawNum.isEmpty()) continue
 
                 val entry = grouped.getOrPut(key) { name to linkedSetOf() }
@@ -217,6 +242,91 @@ class ContactSyncWorker(
             out[key] = ScannedContact(key = key, name = name, phones = sortedPhones, hash = hash)
         }
         return out
+    }
+
+    private fun resolveAllowedContactIds(store: CredentialStore, syncMode: String): Set<Long>? {
+        if (syncMode == "selected_labels") {
+            val labels = store.getSelectedContactLabels()
+            if (labels.isEmpty()) return emptySet()
+            return queryContactIdsByGroupTitles(labels)
+        }
+        if (syncMode == "selected_accounts") {
+            val accounts = store.getSelectedContactAccounts()
+            if (accounts.isEmpty()) return emptySet()
+            return queryContactIdsByAccounts(accounts)
+        }
+        return null
+    }
+
+    private fun queryContactIdsByGroupTitles(titles: Set<String>): Set<Long> {
+        val normalizedTitles = titles.map { it.lowercase() }.toSet()
+        val groupIds = linkedSetOf<Long>()
+        applicationContext.contentResolver.query(
+            ContactsContract.Groups.CONTENT_URI,
+            arrayOf(ContactsContract.Groups._ID, ContactsContract.Groups.TITLE),
+            "${ContactsContract.Groups.DELETED} = 0",
+            null,
+            null
+        )?.use { cursor ->
+            val idIdx = cursor.getColumnIndex(ContactsContract.Groups._ID)
+            val titleIdx = cursor.getColumnIndex(ContactsContract.Groups.TITLE)
+            while (cursor.moveToNext()) {
+                val id = if (idIdx >= 0) cursor.getLong(idIdx) else continue
+                val title = (if (titleIdx >= 0) cursor.getString(titleIdx) else null)?.trim()?.lowercase()
+                if (!title.isNullOrEmpty() && normalizedTitles.contains(title)) {
+                    groupIds.add(id)
+                }
+            }
+        }
+        if (groupIds.isEmpty()) return emptySet()
+
+        val contactIds = linkedSetOf<Long>()
+        val placeholders = groupIds.joinToString(",") { "?" }
+        val args = groupIds.map { it.toString() }.toTypedArray()
+        applicationContext.contentResolver.query(
+            ContactsContract.Data.CONTENT_URI,
+            arrayOf(ContactsContract.Data.CONTACT_ID),
+            "${ContactsContract.Data.MIMETYPE} = ? AND ${ContactsContract.CommonDataKinds.GroupMembership.GROUP_ROW_ID} IN ($placeholders)",
+            arrayOf(ContactsContract.CommonDataKinds.GroupMembership.CONTENT_ITEM_TYPE, *args),
+            null
+        )?.use { cursor ->
+            val cidIdx = cursor.getColumnIndex(ContactsContract.Data.CONTACT_ID)
+            while (cursor.moveToNext()) {
+                if (cidIdx >= 0) contactIds.add(cursor.getLong(cidIdx))
+            }
+        }
+        return contactIds
+    }
+
+    private fun queryContactIdsByAccounts(accounts: Set<String>): Set<Long> {
+        val normalizedAccounts = accounts.map { it.lowercase() }.toSet()
+        val contactIds = linkedSetOf<Long>()
+        applicationContext.contentResolver.query(
+            ContactsContract.RawContacts.CONTENT_URI,
+            arrayOf(
+                ContactsContract.RawContacts.CONTACT_ID,
+                ContactsContract.RawContacts.ACCOUNT_NAME,
+                ContactsContract.RawContacts.ACCOUNT_TYPE
+            ),
+            "${ContactsContract.RawContacts.DELETED} = 0",
+            null,
+            null
+        )?.use { cursor ->
+            val cidIdx = cursor.getColumnIndex(ContactsContract.RawContacts.CONTACT_ID)
+            val nameIdx = cursor.getColumnIndex(ContactsContract.RawContacts.ACCOUNT_NAME)
+            val typeIdx = cursor.getColumnIndex(ContactsContract.RawContacts.ACCOUNT_TYPE)
+            while (cursor.moveToNext()) {
+                val cid = if (cidIdx >= 0) cursor.getLong(cidIdx) else continue
+                val accName = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)?.trim()?.lowercase()
+                val accType = (if (typeIdx >= 0) cursor.getString(typeIdx) else null)?.trim()?.lowercase()
+                if ((!accName.isNullOrEmpty() && normalizedAccounts.contains(accName)) ||
+                    (!accType.isNullOrEmpty() && normalizedAccounts.contains(accType))
+                ) {
+                    contactIds.add(cid)
+                }
+            }
+        }
+        return contactIds
     }
 
     /**
@@ -258,6 +368,8 @@ class ContactSyncWorker(
         const val ERROR_REJECTED = "rejected"
         const val ERROR_SERVER = "server"
         const val ERROR_NETWORK = "network"
+        const val ERROR_SCAN_FAILED = "scan_failed"
+        const val ERROR_EMPTY_SCAN = "empty_scan"
         private const val UNIQUE_PERIODIC = "geargrid_contact_sync_periodic"
         private const val UNIQUE_ONESHOT = "geargrid_contact_sync_oneshot"
 

@@ -10,6 +10,7 @@ import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import live.geargrid.phone.CredentialStore
 import live.geargrid.phone.PhoneNormalizer
@@ -32,6 +33,9 @@ class CallStateTracker : BroadcastReceiver() {
         if (!store.hasCredentials()) return
 
         val stateStr = intent.getStringExtra(TelephonyManager.EXTRA_STATE) ?: return
+        if (!store.isWithinBusinessHours() && stateStr != TelephonyManager.EXTRA_STATE_IDLE) {
+            return
+        }
 
         when (stateStr) {
             TelephonyManager.EXTRA_STATE_RINGING -> {
@@ -41,9 +45,8 @@ class CallStateTracker : BroadcastReceiver() {
                     ?.takeIf { it.isNotEmpty() }
                 val phoneE164 = rawNumber?.let { PhoneNormalizer.normalizeToDigits(it) }
 
-                val hadSession = ActiveCallSession.peek() != null
-                val session = ActiveCallSession.startOrReuse(rawNumber, phoneE164, "INCOMING")
-                if (!hadSession && phoneE164 != null) {
+                val session = ActiveCallSession.startOrReuse(rawNumber, phoneE164, "INCOMING", appContext)
+                if (phoneE164 != null) {
                     val pendingResult = goAsync()
                     CoroutineScope(Dispatchers.IO).launch {
                         try {
@@ -58,14 +61,21 @@ class CallStateTracker : BroadcastReceiver() {
                                 contact
                             )
 
-                            val ringingBody = JSONObject().apply {
-                                put("client_call_id", session.clientCallId)
-                                if (rawNumber != null) put("raw_number", rawNumber) else put("raw_number", JSONObject.NULL)
-                                put("direction", "INCOMING")
-                                put("state", "RINGING")
-                                put("started_at", session.startedAtIso)
+                            val shouldLog = CallPolicyHelper.shouldLogForScope(
+                                store.getCallLoggingScope(),
+                                brief != null,
+                                contact != null
+                            )
+                            if (shouldLog && ActiveCallSession.markRingingPosted(session.clientCallId, appContext)) {
+                                val ringingBody = JSONObject().apply {
+                                    put("client_call_id", session.clientCallId)
+                                    if (rawNumber != null) put("raw_number", rawNumber) else put("raw_number", JSONObject.NULL)
+                                    put("direction", "INCOMING")
+                                    put("state", "RINGING")
+                                    put("started_at", session.startedAtIso)
+                                }
+                                postOrEnqueue(appContext, store, ringingBody)
                             }
-                            postOrEnqueue(appContext, store, ringingBody)
                         } finally {
                             pendingResult.finish()
                         }
@@ -75,54 +85,139 @@ class CallStateTracker : BroadcastReceiver() {
 
             TelephonyManager.EXTRA_STATE_OFFHOOK -> {
                 if (ActiveCallSession.peek() == null) {
-                    ActiveCallSession.startOrReuse(null, null, "OUTGOING")
+                    ActiveCallSession.startOrReuse(null, null, "OUTGOING", appContext)
                 }
-                ActiveCallSession.markOffhook()
+                ActiveCallSession.markOffhook(appContext)
             }
 
             TelephonyManager.EXTRA_STATE_IDLE -> {
                 CallerOverlayManager.dismiss(appContext)
-                val session = ActiveCallSession.consume() ?: return
-
+                if (!store.isWithinBusinessHours()) {
+                    val outsideHours = goAsync()
+                    CoroutineScope(Dispatchers.IO).launch {
+                        try {
+                            ActiveCallSession.consumeOrRestore(appContext)
+                        } finally {
+                            outsideHours.finish()
+                        }
+                    }
+                    return
+                }
                 val endedAtMs = System.currentTimeMillis()
                 val endedAtIso = Instant.ofEpochMilli(endedAtMs).toString()
 
                 val pendingResult = goAsync()
                 CoroutineScope(Dispatchers.IO).launch {
                     try {
-                        val callLogInfo = readRecentCallLog(appContext, session.startedAtMs)
-                        val resolvedRawNumber = session.rawNumber ?: callLogInfo?.number
-                        val resolvedDirection = when (callLogInfo?.type) {
-                            CallLog.Calls.OUTGOING_TYPE -> "OUTGOING"
-                            CallLog.Calls.MISSED_TYPE,
-                            CallLog.Calls.REJECTED_TYPE -> "MISSED"
-                            CallLog.Calls.INCOMING_TYPE -> "INCOMING"
-                            else -> if (!session.answered && session.direction == "INCOMING") {
-                                "MISSED"
-                            } else {
-                                session.direction
+                        val session = ActiveCallSession.consumeOrRestore(appContext)
+                        val loggingScope = store.getCallLoggingScope()
+                        if (session != null) {
+                            val callLogInfo = readRecentCallLogWithRetry(appContext, session.startedAtMs)
+                            val simLabel = callLogInfo?.accountId?.trim()?.takeIf { it.isNotEmpty() }
+                            if (!CallPolicyHelper.matchesSimFilter(store.getSimFilter(), simLabel, simLabel)) {
+                                return@launch
                             }
-                        }
-                        val resolvedDuration = callLogInfo?.durationSeconds
-                            ?: max(0, ((endedAtMs - session.startedAtMs) / 1000L).toInt())
+                            val resolvedRawNumber = session.rawNumber ?: callLogInfo?.number
+                            val resolvedPhoneE164 = session.phoneE164
+                                ?: resolvedRawNumber?.let { PhoneNormalizer.normalizeToDigits(it) }
 
-                        val endedBody = JSONObject().apply {
-                            put("client_call_id", session.clientCallId)
-                            if (!resolvedRawNumber.isNullOrBlank()) {
-                                put("raw_number", resolvedRawNumber)
-                            } else {
-                                put("raw_number", JSONObject.NULL)
+                            val db = AppDatabase.getInstance(appContext)
+                            val briefDao = db.briefDao()
+                            val hasBrief = resolvedPhoneE164 != null && briefDao.findBriefByPhone(resolvedPhoneE164) != null
+                            val hasContact = resolvedPhoneE164 != null && briefDao.findContactByPhone(resolvedPhoneE164) != null
+                            val isAllowed = session.ringingPosted ||
+                                CallPolicyHelper.shouldLogForScope(loggingScope, hasBrief, hasContact)
+                            if (!isAllowed) {
+                                return@launch
                             }
-                            put("direction", resolvedDirection)
-                            put("state", "ENDED")
-                            put("started_at", session.startedAtIso)
-                            put("ended_at", endedAtIso)
-                            put("duration_seconds", resolvedDuration)
-                        }
 
-                        postOrEnqueue(appContext, store, endedBody)
-                        BriefSyncWorker.enqueueOneShot(appContext)
-                        OutboxWorker.enqueueOneShot(appContext)
+                            val resolvedDirection = mapCallDirection(callLogInfo?.type, session.answered, session.direction)
+                            val resolvedDuration = callLogInfo?.durationSeconds
+                                ?: max(0, ((endedAtMs - session.startedAtMs) / 1000L).toInt())
+
+                            val endedBody = JSONObject().apply {
+                                put("client_call_id", session.clientCallId)
+                                if (!resolvedRawNumber.isNullOrBlank()) {
+                                    put("raw_number", resolvedRawNumber)
+                                } else {
+                                    put("raw_number", JSONObject.NULL)
+                                }
+                                put("direction", resolvedDirection)
+                                put("state", "ENDED")
+                                put("started_at", session.startedAtIso)
+                                put("ended_at", endedAtIso)
+                                put("duration_seconds", resolvedDuration)
+                                if (!simLabel.isNullOrBlank()) put("sim_label", simLabel.take(40))
+                            }
+
+                            postOrEnqueue(appContext, store, endedBody)
+                            showAfterCallCardIfReady(
+                                appContext,
+                                store,
+                                session.clientCallId,
+                                resolvedRawNumber,
+                                resolvedPhoneE164
+                            )
+                            BriefSyncWorker.enqueueOneShot(appContext)
+                            OutboxWorker.enqueueOneShot(appContext)
+                        } else {
+                            // A-09 call-log fallback when session was lost (e.g. OEM killed process).
+                            val lookbackStartMs = endedAtMs - FALLBACK_LOOKBACK_MS
+                            val fallbackEntry = readRecentCallLogWithRetry(appContext, lookbackStartMs)
+                                ?: return@launch
+                            if (fallbackEntry.dateMs < lookbackStartMs) return@launch
+                            val simLabel = fallbackEntry.accountId?.trim()?.takeIf { it.isNotEmpty() }
+                            if (!CallPolicyHelper.matchesSimFilter(store.getSimFilter(), simLabel, simLabel)) {
+                                return@launch
+                            }
+
+                            val phoneE164 = fallbackEntry.number?.let { PhoneNormalizer.normalizeToDigits(it) }
+                            val db = AppDatabase.getInstance(appContext)
+                            val briefDao = db.briefDao()
+                            val hasBrief = phoneE164 != null && briefDao.findBriefByPhone(phoneE164) != null
+                            val hasContact = phoneE164 != null && briefDao.findContactByPhone(phoneE164) != null
+                            if (!CallPolicyHelper.shouldLogForScope(loggingScope, hasBrief, hasContact)) {
+                                return@launch
+                            }
+
+                            val dedupKey = "calllog:${phoneE164 ?: "anon"}:${fallbackEntry.dateMs}"
+                            val prefs = appContext.getSharedPreferences("geargrid_call_fallback", Context.MODE_PRIVATE)
+                            if (prefs.getString("last_key", null) == dedupKey) {
+                                return@launch
+                            }
+                            prefs.edit().putString("last_key", dedupKey).apply()
+
+                            val startedIso = Instant.ofEpochMilli(fallbackEntry.dateMs).toString()
+                            val fallbackEndedIso = Instant.ofEpochMilli(
+                                max(fallbackEntry.dateMs, fallbackEntry.dateMs + fallbackEntry.durationSeconds * 1000L)
+                            ).toString()
+
+                            val endedBody = JSONObject().apply {
+                                put("client_call_id", dedupKey)
+                                if (!fallbackEntry.number.isNullOrBlank()) {
+                                    put("raw_number", fallbackEntry.number)
+                                } else {
+                                    put("raw_number", JSONObject.NULL)
+                                }
+                                put("direction", mapCallDirection(fallbackEntry.type, fallbackEntry.durationSeconds > 0, "INCOMING"))
+                                put("state", "ENDED")
+                                put("started_at", startedIso)
+                                put("ended_at", fallbackEndedIso)
+                                put("duration_seconds", fallbackEntry.durationSeconds)
+                                if (!simLabel.isNullOrBlank()) put("sim_label", simLabel.take(40))
+                            }
+
+                            postOrEnqueue(appContext, store, endedBody)
+                            showAfterCallCardIfReady(
+                                appContext,
+                                store,
+                                dedupKey,
+                                fallbackEntry.number,
+                                phoneE164
+                            )
+                            BriefSyncWorker.enqueueOneShot(appContext)
+                            OutboxWorker.enqueueOneShot(appContext)
+                        }
                     } finally {
                         pendingResult.finish()
                     }
@@ -130,6 +225,15 @@ class CallStateTracker : BroadcastReceiver() {
             }
         }
     }
+
+    private fun mapCallDirection(callLogType: Int?, answered: Boolean, defaultDirection: String): String =
+        when (callLogType) {
+            CallLog.Calls.OUTGOING_TYPE -> "OUTGOING"
+            CallLog.Calls.MISSED_TYPE,
+            CallLog.Calls.REJECTED_TYPE -> "MISSED"
+            CallLog.Calls.INCOMING_TYPE -> "INCOMING"
+            else -> if (!answered && defaultDirection == "INCOMING") "MISSED" else defaultDirection
+        }
 
     private suspend fun postOrEnqueue(
         context: Context,
@@ -148,6 +252,72 @@ class CallStateTracker : BroadcastReceiver() {
         }
     }
 
+    internal suspend fun showAfterCallCardIfReady(
+        context: Context,
+        store: CredentialStore,
+        clientCallId: String,
+        rawNumber: String?,
+        phoneE164: String?
+    ) {
+        if (!store.isAfterCallCardEnabled()) return
+        val briefDao = AppDatabase.getInstance(context).briefDao()
+        val brief = phoneE164?.let { briefDao.findBriefByPhone(it) }
+        val contact = if (brief == null && phoneE164 != null) briefDao.findContactByPhone(phoneE164) else null
+        val label = brief?.displayName ?: contact?.displayName ?: rawNumber ?: "Caller"
+
+        val isUnknownCaller = brief == null && contact == null && !rawNumber.isNullOrBlank()
+        CallerOverlayManager.showAfterCallCard(
+            context = context,
+            clientCallId = clientCallId,
+            callerLabel = label,
+            customerId = brief?.customerId,
+            isUnknownCaller = isUnknownCaller,
+            onOpenOnDesktop = brief?.customerId?.let { cid ->
+                {
+                    CoroutineScope(Dispatchers.IO).launch {
+                        runCatching {
+                            val body = JSONObject().apply {
+                                put("customer_id", cid)
+                                put("call_id", clientCallId)
+                            }
+                            DeviceApiClient(store).post("/device/pos/open-customer", body)
+                        }
+                    }
+                }
+            },
+            onSaveLead = if (isUnknownCaller && !rawNumber.isNullOrBlank()) {
+                { leadName, leadNote ->
+                    CoroutineScope(Dispatchers.IO).launch {
+                        runCatching {
+                            val body = JSONObject().apply {
+                                put("display_name", leadName)
+                                put("phone", rawNumber)
+                                put("note", leadNote ?: JSONObject.NULL)
+                                put("call_id", clientCallId)
+                            }
+                            DeviceApiClient(store).post("/device/leads", body)
+                        }
+                    }
+                }
+            } else {
+                null
+            }
+        ) { tags, note, followUpOn ->
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    val body = JSONObject().apply {
+                        put("tags", org.json.JSONArray(tags))
+                        put("note", note ?: JSONObject.NULL)
+                        put("follow_up_on", followUpOn ?: JSONObject.NULL)
+                    }
+                    val encodedId = java.net.URLEncoder.encode(clientCallId, "UTF-8")
+                    DeviceApiClient(store).post("/device/calls/$encodedId/note", body)
+                    BriefSyncWorker.enqueueOneShot(context)
+                }
+            }
+        }
+    }
+
     private suspend fun enqueueCallOutbox(context: Context, payload: JSONObject) {
         AppDatabase.getInstance(context).contactSyncDao().enqueueOutbox(
             OutboxEntity(
@@ -162,10 +332,24 @@ class CallStateTracker : BroadcastReceiver() {
     private data class CallLogEntry(
         val number: String?,
         val durationSeconds: Int,
-        val type: Int
+        val type: Int,
+        val dateMs: Long,
+        val accountId: String?
     )
 
-    private fun readRecentCallLog(context: Context, minStartedAtMs: Long): CallLogEntry? {
+    /**
+     * Queries the CallLog with retries (immediate, +1.5s, +2.5s = 4s total) because Android
+     * frequently commits the new call-log row after ACTION_PHONE_STATE_CHANGED(IDLE) fires.
+     */
+    private suspend fun readRecentCallLogWithRetry(context: Context, minStartedAtMs: Long): CallLogEntry? {
+        readRecentCallLogOnce(context, minStartedAtMs)?.let { return it }
+        delay(1_500L)
+        readRecentCallLogOnce(context, minStartedAtMs)?.let { return it }
+        delay(2_500L)
+        return readRecentCallLogOnce(context, minStartedAtMs)
+    }
+
+    private fun readRecentCallLogOnce(context: Context, minStartedAtMs: Long): CallLogEntry? {
         val granted = ContextCompat.checkSelfPermission(
             context,
             Manifest.permission.READ_CALL_LOG
@@ -176,7 +360,8 @@ class CallStateTracker : BroadcastReceiver() {
             CallLog.Calls.NUMBER,
             CallLog.Calls.DURATION,
             CallLog.Calls.TYPE,
-            CallLog.Calls.DATE
+            CallLog.Calls.DATE,
+            CallLog.Calls.PHONE_ACCOUNT_ID
         )
         val selection = "${CallLog.Calls.DATE} >= ?"
         val selectionArgs = arrayOf((minStartedAtMs - 15_000L).toString())
@@ -193,16 +378,55 @@ class CallStateTracker : BroadcastReceiver() {
                 val numIdx = cursor.getColumnIndex(CallLog.Calls.NUMBER)
                 val durIdx = cursor.getColumnIndex(CallLog.Calls.DURATION)
                 val typeIdx = cursor.getColumnIndex(CallLog.Calls.TYPE)
+                val dateIdx = cursor.getColumnIndex(CallLog.Calls.DATE)
+                val accIdx = cursor.getColumnIndex(CallLog.Calls.PHONE_ACCOUNT_ID)
                 CallLogEntry(
                     number = if (numIdx >= 0) cursor.getString(numIdx)?.trim()?.takeIf { it.isNotEmpty() } else null,
                     durationSeconds = if (durIdx >= 0) max(0, cursor.getInt(durIdx)) else 0,
-                    type = if (typeIdx >= 0) cursor.getInt(typeIdx) else -1
+                    type = if (typeIdx >= 0) cursor.getInt(typeIdx) else -1,
+                    dateMs = if (dateIdx >= 0) cursor.getLong(dateIdx) else 0L,
+                    accountId = if (accIdx >= 0) cursor.getString(accIdx)?.trim()?.takeIf { it.isNotEmpty() } else null
                 )
             }
         } catch (_: SecurityException) {
             null
         } catch (_: Exception) {
             null
+        }
+    }
+
+    companion object {
+        private const val FALLBACK_LOOKBACK_MS = 10 * 60 * 1000L
+
+        /** "Add note" / "Call back later" on the caller screen: opens the after-call card for the call in progress. */
+        fun openAfterCallCardForActiveCall(context: Context) {
+            val appContext = context.applicationContext
+            val session = ActiveCallSession.peek() ?: return
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    CallStateTracker().showAfterCallCardIfReady(
+                        appContext, CredentialStore(appContext), session.clientCallId, session.rawNumber, session.phoneE164
+                    )
+                }
+            }
+        }
+
+        /** "Open on desktop": tells the paired user's counter to open this customer. */
+        fun openActiveCustomerOnDesktop(context: Context) {
+            val appContext = context.applicationContext
+            val session = ActiveCallSession.peek() ?: return
+            val phone = session.phoneE164 ?: return
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    val store = CredentialStore(appContext)
+                    val brief = AppDatabase.getInstance(appContext).briefDao().findBriefByPhone(phone) ?: return@runCatching
+                    val body = JSONObject().apply {
+                        put("customer_id", brief.customerId)
+                        put("call_id", session.clientCallId)
+                    }
+                    DeviceApiClient(store).post("/device/pos/open-customer", body)
+                }
+            }
         }
     }
 }
