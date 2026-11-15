@@ -1,0 +1,173 @@
+package live.geargrid.phone.call
+
+import android.telecom.Call
+import android.telecom.CallScreeningService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import live.geargrid.phone.CredentialStore
+import live.geargrid.phone.PhoneNormalizer
+import live.geargrid.phone.api.DeviceApiClient
+import live.geargrid.phone.db.AppDatabase
+import live.geargrid.phone.db.BriefEntity
+import live.geargrid.phone.db.BriefPhoneEntity
+import live.geargrid.phone.db.ContactIndexEntity
+import live.geargrid.phone.db.OutboxEntity
+import live.geargrid.phone.sync.OutboxWorker
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.URLEncoder
+
+class GearGridCallScreeningService : CallScreeningService() {
+
+    override fun onScreenCall(callDetails: Call.Details) {
+        // Always let the call ring immediately without delay or blocking.
+        respondToCall(
+            callDetails,
+            CallResponse.Builder()
+                .setDisallowCall(false)
+                .setRejectCall(false)
+                .setSkipCallLog(false)
+                .setSkipNotification(false)
+                .build()
+        )
+
+        val appContext = applicationContext
+        val store = CredentialStore(appContext)
+        if (!store.hasCredentials()) return
+
+        val direction = if (callDetails.callDirection == Call.Details.DIRECTION_OUTGOING) {
+            "OUTGOING"
+        } else {
+            "INCOMING"
+        }
+
+        val rawNumber = callDetails.handle?.schemeSpecificPart?.trim()?.takeIf { it.isNotEmpty() }
+        val phoneE164 = rawNumber?.let { PhoneNormalizer.normalizeToDigits(it) }
+        val phoneDisplay = rawNumber ?: "Unknown caller"
+
+        val session = ActiveCallSession.startOrReuse(rawNumber, phoneE164, direction)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val db = AppDatabase.getInstance(appContext)
+            val briefDao = db.briefDao()
+            val contactDao = db.contactSyncDao()
+            val api = DeviceApiClient(store)
+
+            val localBrief = phoneE164?.let { briefDao.findBriefByPhone(it) }
+            val localContact = if (localBrief == null && phoneE164 != null) {
+                briefDao.findContactByPhone(it)
+            } else {
+                null
+            }
+
+            if (direction == "INCOMING") {
+                CallerOverlayManager.showBrief(appContext, phoneDisplay, localBrief, localContact)
+            }
+
+            val ringingBody = JSONObject().apply {
+                put("client_call_id", session.clientCallId)
+                if (rawNumber != null) put("raw_number", rawNumber) else put("raw_number", JSONObject.NULL)
+                put("direction", direction)
+                put("state", "RINGING")
+                put("started_at", session.startedAtIso)
+            }
+
+            try {
+                api.post("/device/calls", ringingBody)
+            } catch (e: DeviceApiClient.HttpException) {
+                if (e.code !in listOf(400, 401, 403, 409)) {
+                    contactDao.enqueueOutbox(
+                        OutboxEntity(
+                            kind = OutboxWorker.KIND_CALL_EVENT,
+                            payloadJson = ringingBody.toString(),
+                            createdAt = System.currentTimeMillis()
+                        )
+                    )
+                    OutboxWorker.enqueueOneShot(appContext)
+                }
+            } catch (_: Exception) {
+                contactDao.enqueueOutbox(
+                    OutboxEntity(
+                        kind = OutboxWorker.KIND_CALL_EVENT,
+                        payloadJson = ringingBody.toString(),
+                        createdAt = System.currentTimeMillis()
+                    )
+                )
+                OutboxWorker.enqueueOneShot(appContext)
+            }
+
+            if (direction == "INCOMING" && phoneE164 != null) {
+                val lookupJson = withTimeoutOrNull(2_000L) {
+                    try {
+                        val encoded = URLEncoder.encode(phoneE164, "UTF-8")
+                        api.get("/device/briefs/lookup?phone=$encoded")
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+                val data = lookupJson?.optJSONObject("data") ?: return@launch
+                if (ActiveCallSession.peek()?.clientCallId != session.clientCallId) return@launch
+
+                when (data.optString("match")) {
+                    "customer" -> {
+                        val obj = data.optJSONObject("brief") ?: return@launch
+                        val customerId = obj.optLong("customer_id", 0L)
+                        if (customerId <= 0L) return@launch
+                        val freshBrief = BriefEntity(
+                            customerId = customerId,
+                            displayName = obj.optString("display_name", "Customer #$customerId"),
+                            companyName = obj.optNullableString("company_name"),
+                            parentCompany = obj.optNullableString("parent_company"),
+                            rating = if (obj.isNull("rating")) null else obj.optDouble("rating"),
+                            status = obj.optString("status", "Active"),
+                            balanceDue = obj.optDouble("balance_due", 0.0),
+                            depositBalance = obj.optDouble("deposit_balance", 0.0),
+                            idRetained = obj.optBoolean("id_retained", false),
+                            activeItemsJson = (obj.optJSONArray("active_items") ?: JSONArray()).toString(),
+                            invoiceCount = obj.optInt("invoice_count", 0),
+                            firstRental = obj.optNullableString("first_rental"),
+                            lastRental = obj.optNullableString("last_rental"),
+                            lastPaymentJson = obj.optJSONObject("last_payment")?.toString(),
+                            lastReviewComment = obj.optNullableString("last_review_comment"),
+                            summaryLine = obj.optString("summary_line", ""),
+                            updatedAt = obj.optString("updated_at", "")
+                        )
+                        val phonesJson = obj.optJSONArray("phones") ?: JSONArray()
+                        val phoneRows = ArrayList<BriefPhoneEntity>(phonesJson.length())
+                        for (i in 0 until phonesJson.length()) {
+                            val num = phonesJson.optString(i).trim()
+                            if (num.isNotEmpty()) {
+                                phoneRows.add(BriefPhoneEntity(phoneE164 = num, customerId = customerId))
+                            }
+                        }
+                        briefDao.deleteBriefPhonesByCustomerIds(listOf(customerId))
+                        briefDao.upsertBriefs(listOf(freshBrief))
+                        if (phoneRows.isNotEmpty()) briefDao.upsertBriefPhones(phoneRows)
+                        CallerOverlayManager.showBrief(appContext, phoneDisplay, freshBrief, null)
+                    }
+                    "contact" -> {
+                        val cObj = data.optJSONObject("contact") ?: return@launch
+                        val name = cObj.optString("display_name", "").trim()
+                        if (name.isNotEmpty()) {
+                            val remoteContact = ContactIndexEntity(
+                                phoneE164 = phoneE164,
+                                displayName = name,
+                                contactKey = "remote:${cObj.optLong("contact_id", 0L)}",
+                                updatedAt = System.currentTimeMillis()
+                            )
+                            CallerOverlayManager.showBrief(appContext, phoneDisplay, null, remoteContact)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun JSONObject.optNullableString(key: String): String? {
+        if (isNull(key)) return null
+        val value = optString(key, "").trim()
+        return if (value.isEmpty() || value == "null") null else value
+    }
+}

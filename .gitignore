@@ -1,0 +1,19 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Firebase & Android signing secrets — NEVER commit
+google-services.json
+**/google-services.json
+*.jks
+*.keystore
+keystore.properties
+
+# Gradle & IDE build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/assets/
+.idea/
