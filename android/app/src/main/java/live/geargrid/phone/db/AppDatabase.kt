@@ -94,13 +94,13 @@ interface ContactSyncDao {
     @Insert
     suspend fun enqueueOutbox(row: OutboxEntity)
 
-    @Query("SELECT * FROM sync_outbox WHERE nextRetryAt <= :nowMs ORDER BY createdAt ASC LIMIT :limit")
+    @Query("SELECT * FROM outbox WHERE nextRetryAt <= :nowMs ORDER BY createdAt ASC LIMIT :limit")
     suspend fun getDueOutbox(nowMs: Long, limit: Int = 50): List<OutboxEntity>
 
-    @Query("DELETE FROM sync_outbox WHERE id = :id")
+    @Query("DELETE FROM outbox WHERE id = :id")
     suspend fun deleteOutboxById(id: Long)
 
-    @Query("UPDATE sync_outbox SET attempts = :attempts, nextRetryAt = :nextRetryAt WHERE id = :id")
+    @Query("UPDATE outbox SET attempts = :attempts, nextRetryAt = :nextRetryAt WHERE id = :id")
     suspend fun updateOutboxRetry(id: Long, attempts: Int, nextRetryAt: Long)
 }
 
