@@ -128,6 +128,18 @@ interface BriefDao {
     @Query("SELECT * FROM contact_index WHERE phoneE164 = :phoneE164 LIMIT 1")
     suspend fun findContactByPhone(phoneE164: String): ContactIndexEntity?
 
+    @Query(
+        "SELECT DISTINCT b.* FROM briefs b " +
+            "LEFT JOIN brief_phones bp ON bp.customerId = b.customerId " +
+            "WHERE (:query != '' AND (b.displayName LIKE '%' || :query || '%' OR b.companyName LIKE '%' || :query || '%')) " +
+            "OR (:digits != '' AND bp.phoneE164 LIKE '%' || :digits || '%') " +
+            "ORDER BY b.displayName ASC LIMIT :limit"
+    )
+    suspend fun searchBriefs(query: String, digits: String, limit: Int = 25): List<BriefEntity>
+
+    @Query("SELECT phoneE164 FROM brief_phones WHERE customerId = :customerId")
+    suspend fun getPhonesForCustomer(customerId: Long): List<String>
+
     @Query("DELETE FROM briefs")
     suspend fun clearBriefs()
 
@@ -141,14 +153,16 @@ interface BriefDao {
         BriefPhoneEntity::class,
         ContactIndexEntity::class,
         ContactStateEntity::class,
-        OutboxEntity::class
+        OutboxEntity::class,
+        ActiveCallEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun contactSyncDao(): ContactSyncDao
     abstract fun briefDao(): BriefDao
+    abstract fun activeCallDao(): ActiveCallDao
 
     companion object {
         @Volatile
@@ -160,7 +174,10 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "geargrid_phone_assistant.db"
-                ).build().also { INSTANCE = it }
+                )
+                    .fallbackToDestructiveMigration()
+                    .build()
+                    .also { INSTANCE = it }
             }
     }
 }

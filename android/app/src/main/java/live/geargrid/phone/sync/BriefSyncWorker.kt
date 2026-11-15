@@ -36,12 +36,56 @@ class BriefSyncWorker(
 
         val api = DeviceApiClient(store)
         val briefDao = AppDatabase.getInstance(applicationContext).briefDao()
-        val since = store.getBriefsSinceCursor()
 
         var cursor: Long? = null
         var lastServerTime: String? = null
 
         try {
+            api.checkOfflineWipe()
+            api.rotateTokenIfNeeded()
+            runCatching {
+                val policyData = api.get("/device/policy").optJSONObject("data")
+                if (policyData != null) {
+                    store.setDevicePolicyJson(policyData.toString())
+                    policyData.optString("device_status", "").takeIf { it.isNotBlank() }?.let {
+                        store.setDeviceStatus(it)
+                    }
+                    val wipeDays = policyData.optInt("offline_wipe_days", 0)
+                    if (wipeDays > 0) store.setOfflineWipeDays(wipeDays)
+                    policyData.optJSONObject("effective_capabilities")?.let {
+                        store.setEffectiveCapabilitiesJson(it.toString())
+                    }
+                    policyData.optJSONObject("capability_reasons")?.let {
+                        store.setCapabilityReasonsJson(it.toString())
+                    }
+                    policyData.optString("contact_sync_mode", "").takeIf { it.isNotBlank() }?.let {
+                        store.setContactSyncMode(it)
+                    }
+                    policyData.optString("call_logging_scope", "").takeIf { it.isNotBlank() }?.let {
+                        store.setCallLoggingScope(it)
+                    }
+                    store.setSimFilter(policyData.optNullableString("sim_filter"))
+                    policyData.optJSONObject("after_call_card")?.let { afterCall ->
+                        store.setAfterCallCardEnabled(afterCall.optBoolean("enabled", true))
+                        store.setAfterCallDismissSeconds(afterCall.optInt("auto_dismiss_seconds", 25))
+                        afterCall.optJSONArray("tags")?.let { tagsArr ->
+                            val list = (0 until tagsArr.length())
+                                .mapNotNull { i -> tagsArr.optString(i, "").trim().takeIf { it.isNotEmpty() } }
+                            if (list.isNotEmpty()) {
+                                store.setAfterCallTags(list)
+                            }
+                        }
+                    }
+                    policyData.optString("min_app_version", "").trim().takeIf { it.isNotEmpty() }?.let {
+                        store.setMinAppVersion(it)
+                    }
+                    policyData.optString("latest_app_version", "").trim().takeIf { it.isNotEmpty() }?.let {
+                        store.setLatestAppVersion(it)
+                    }
+                }
+            }
+            val since = store.getBriefsSinceCursor()
+
             do {
                 val currentCursor = cursor
                 val query = buildString {
@@ -147,6 +191,7 @@ class BriefSyncWorker(
                 store.setBriefsSinceCursor(lastServerTime)
                 store.setBriefsSyncedAt(lastServerTime)
             }
+            store.setLastSyncSuccessMs(System.currentTimeMillis())
             return@withContext Result.success()
         } catch (e: DeviceApiClient.HttpException) {
             return@withContext if (e.code == 401 || e.code == 403 || e.code == 409) {
