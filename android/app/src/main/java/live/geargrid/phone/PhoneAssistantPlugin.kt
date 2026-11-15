@@ -191,6 +191,25 @@ class PhoneAssistantPlugin : Plugin() {
     @PluginMethod
     fun setContactSyncEnabled(call: PluginCall) {
         val enabled = call.getBoolean("enabled") ?: false
+        // Turning sync on needs READ_CONTACTS first, so ask before saving anything.
+        if (enabled && !hasPerm(Manifest.permission.READ_CONTACTS)) {
+            requestPermissionForAlias("contacts", call, "onContactsPermissionForSync")
+            return
+        }
+        applyContactSync(call, enabled)
+    }
+
+    @PermissionCallback
+    private fun onContactsPermissionForSync(call: PluginCall) {
+        if (hasPerm(Manifest.permission.READ_CONTACTS)) {
+            applyContactSync(call, true)
+        } else {
+            // Denied: leave sync off and report the unchanged status.
+            call.resolve(buildSetupStatus())
+        }
+    }
+
+    private fun applyContactSync(call: PluginCall, enabled: Boolean) {
         val consented = call.getBoolean("consented") ?: enabled
         store.setContactSyncEnabled(enabled)
         if (enabled && consented) {
@@ -230,6 +249,13 @@ class PhoneAssistantPlugin : Plugin() {
 
     @PermissionCallback
     private fun onPermissionResult(call: PluginCall) {
+        // Sync may already be on from before the permission was granted; start watching now.
+        if (store.isContactSyncEnabled() && store.hasContactsConsent() &&
+            hasPerm(Manifest.permission.READ_CONTACTS)
+        ) {
+            ContactsObserver.register(context)
+            ContactSyncWorker.enqueueOneShot(context)
+        }
         call.resolve(buildSetupStatus())
     }
 
