@@ -60,6 +60,7 @@ class GearGridMessagingService : FirebaseMessagingService() {
         }
         if (type == "device_suspended") {
             CredentialStore(applicationContext).setDeviceStatus("SUSPENDED")
+            RevocationHandler.signOutFullApp(applicationContext)
             RevocationHandler.wipe(applicationContext, keepCredentials = true)
             return
         }
@@ -70,6 +71,10 @@ class GearGridMessagingService : FirebaseMessagingService() {
         if (type == "device_resumed" || type == "device_approved") {
             CredentialStore(applicationContext).setDeviceStatus("ACTIVE")
             live.geargrid.phone.sync.BriefSyncWorker.enqueueOneShot(applicationContext)
+            return
+        }
+        if (type == "sample_call") {
+            live.geargrid.phone.call.CallerOverlayManager.showSample(applicationContext)
             return
         }
         if (type == "policy_changed") {
@@ -151,6 +156,9 @@ class GearGridMessagingService : FirebaseMessagingService() {
                 else NotificationCompat.PRIORITY_HIGH
             )
 
+        runCatching {
+            AlertStore.add(CredentialStore(applicationContext), title, body, channelId, type.ifBlank { null }, invoiceId.ifBlank { null })
+        }
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return
         val notificationId = invoiceId.toIntOrNull() ?: (System.currentTimeMillis() % 100_000L).toInt()

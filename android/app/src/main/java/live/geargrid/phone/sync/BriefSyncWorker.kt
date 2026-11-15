@@ -39,6 +39,7 @@ class BriefSyncWorker(
 
         var cursor: Long? = null
         var lastServerTime: String? = null
+        var totalUpdated = 0
 
         try {
             api.checkOfflineWipe()
@@ -136,7 +137,9 @@ class BriefSyncWorker(
                             lastReviewComment = obj.optNullableString("last_review_comment"),
                             summaryLine = obj.optString("summary_line", ""),
                             updatedAt = obj.optString("updated_at", ""),
-                            syncedAt = data.optString("server_time", java.time.Instant.now().toString())
+                            syncedAt = data.optString("server_time", java.time.Instant.now().toString()),
+                            hasDues = obj.optBoolean("has_dues", false),
+                            nicNumber = obj.optNullableString("nic_number")
                         )
                     )
 
@@ -161,6 +164,7 @@ class BriefSyncWorker(
                 }
                 if (briefEntities.isNotEmpty()) {
                     briefDao.upsertBriefs(briefEntities)
+                    totalUpdated += briefEntities.size
                 }
                 if (phoneEntities.isNotEmpty()) {
                     briefDao.upsertBriefPhones(phoneEntities)
@@ -193,17 +197,42 @@ class BriefSyncWorker(
                 store.setBriefsSyncedAt(lastServerTime)
             }
             store.setLastSyncSuccessMs(System.currentTimeMillis())
+            store.setLastSyncResult(true, totalUpdated, null)
+            reportSyncState(store, api)
             return@withContext Result.success()
         } catch (e: DeviceApiClient.HttpException) {
+            store.setLastSyncResult(false, null, "http_${e.code}")
             return@withContext if (e.code == 401 || e.code == 403 || e.code == 409) {
                 Result.failure()
             } else {
                 Result.retry()
             }
         } catch (_: IOException) {
+            store.setLastSyncResult(false, null, "no_connection")
             return@withContext Result.retry()
         } catch (_: Exception) {
+            store.setLastSyncResult(false, null, "failed")
             return@withContext Result.retry()
+        }
+    }
+
+    /** Tells the shop's phone list how fresh this phone is (last syncs, customers cached, queued uploads). */
+    private suspend fun reportSyncState(store: CredentialStore, api: DeviceApiClient) {
+        runCatching {
+            val db = AppDatabase.getInstance(applicationContext)
+            val version = runCatching {
+                applicationContext.packageManager.getPackageInfo(applicationContext.packageName, 0).versionName
+            }.getOrNull() ?: "1.0.0"
+            val body = JSONObject().apply {
+                put("app_version", version)
+                put("brief_format", 2)
+                put("cached_briefs", db.briefDao().countBriefs())
+                put("outbox_pending", db.contactSyncDao().countOutbox())
+                store.getBriefsSyncedAt()?.let { put("last_brief_sync_at", it) }
+                store.getContactsSyncedAt()?.let { put("last_contact_sync_at", it) }
+                put("reported_state", JSONObject().apply { put("call_screen_unsupported", store.isCallScreenUnsupported()) })
+            }
+            api.post("/device/register", body)
         }
     }
 

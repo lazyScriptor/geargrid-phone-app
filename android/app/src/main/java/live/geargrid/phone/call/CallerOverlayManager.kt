@@ -30,6 +30,7 @@ import androidx.core.content.ContextCompat
 import live.geargrid.phone.CredentialStore
 import live.geargrid.phone.GearGridMessagingService
 import live.geargrid.phone.MainActivity
+import live.geargrid.phone.PhoneStrings
 import live.geargrid.phone.db.BriefEntity
 import live.geargrid.phone.db.ContactIndexEntity
 import org.json.JSONArray
@@ -50,7 +51,8 @@ object CallerOverlayManager {
         context: Context,
         phoneDisplay: String,
         brief: BriefEntity?,
-        contact: ContactIndexEntity?
+        contact: ContactIndexEntity?,
+        live: Boolean = false
     ) {
         val appContext = context.applicationContext
         val store = CredentialStore(appContext)
@@ -62,61 +64,115 @@ object CallerOverlayManager {
 
         val isLocked = (appContext.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)
             ?.isKeyguardLocked == true
-        val lockMode = store.getLockScreenMode()
+        val parsed = CallDesignParser.parse(store.getCallDesignJson())
+        store.setCallScreenUnsupported(parsed.unsupported)
+        // Strictest of the profile's lock-screen mode and the design's own.
+        val lockMode = CallScreenLogic.stricterLockMode(store.getLockScreenMode(), parsed.design.lockedMode)
         if (isLocked && lockMode == "hidden") return
 
-        val isBlacklisted = brief?.status == "Blacklisted"
-        val title = brief?.displayName
-            ?: contact?.displayName
-            ?: "Not in GearGrid"
+        val language = PhoneStrings.resolveLanguage(store.getAppLanguage())
+        val data = buildCardData(brief, contact, phoneDisplay)
+        val footer = footerFor(appContext, store, brief, live, language)
+
         val computedSummary = brief?.let { computeLiveSummaryLine(it) }.orEmpty()
-        val rawSubtitle = when {
-            brief != null && computedSummary.isNotBlank() -> computedSummary
-            contact != null -> "Saved in phone contacts · $phoneDisplay"
-            else -> phoneDisplay
-        }
-        val rawRatingText = brief?.rating?.let { String.format(Locale.US, "★ %.1f", it) }
-
-        val visiblePhone = if (!isLocked || lockMode == "full") phoneDisplay else ""
-        val visibleSubtitle = if (!isLocked || lockMode == "full") rawSubtitle else ""
-        val visibleRatingText = when {
-            !isLocked -> rawRatingText
-            lockMode == "full" || lockMode == "name_rating" -> rawRatingText
-            else -> null
-        }
-
-        val position = store.getOverlayPosition()
-        val autoDismissSeconds = store.getOverlayAutoDismissSeconds()
-        val syncFooter = brief?.syncedAt?.let { syncedAt ->
-            val ageMinutes = runCatching { Duration.between(Instant.parse(syncedAt), Instant.now()).toMinutes().coerceAtLeast(0) }.getOrDefault(0)
-            val stale = ageMinutes > store.getSyncStaleAfterMinutes()
+        val fallbackTitle = brief?.displayName ?: contact?.displayName ?: PhoneStrings.get(language, "not_in_geargrid")
+        val fallbackSubtitle = if (!isLocked || lockMode == "full") {
             when {
-                store.getSyncFooterMode() == "never" -> ""
-                stale -> "Offline · data from ${syncedAt.replace("T", " ").take(16)}"
-                store.getSyncFooterMode() == "only_when_stale" -> ""
-                else -> "Synced $ageMinutes min ago"
+                brief != null && computedSummary.isNotBlank() -> computedSummary
+                contact != null -> "${PhoneStrings.get(language, "saved_contact")} · $phoneDisplay"
+                else -> phoneDisplay
             }
-        } ?: ""
+        } else ""
 
         if (Settings.canDrawOverlays(appContext)) {
             mainHandler.post {
-                showWindowOverlay(
-                    appContext,
-                    title,
-                    visiblePhone,
-                    visibleSubtitle,
-                    visibleRatingText,
-                    isBlacklisted,
-                    position,
-                    autoDismissSeconds,
-                    syncFooter,
-                    store.getCallTextScale()
-                )
+                showCard(appContext, store, data, footer, isLocked, lockMode, language, fallbackTitle, fallbackSubtitle)
             }
         } else {
-            showFallbackNotification(appContext, title, visibleSubtitle, isBlacklisted)
+            showFallbackNotification(appContext, fallbackTitle, fallbackSubtitle, data.blacklisted)
         }
     }
+
+    /** "Sample call" from the phone or the web designer: the real renderer with sample data. */
+    fun showSample(context: Context) {
+        val appContext = context.applicationContext
+        val store = CredentialStore(appContext)
+        val language = PhoneStrings.resolveLanguage(store.getAppLanguage())
+        val data = CallCardData(
+            isUnknown = false, isPhoneContact = false, name = PhoneStrings.get(language, "sample_name"),
+            company = "GearGrid Rentals", rating = 4.0, blacklisted = false, balanceDue = 18500.0, hasDues = true,
+            depositBalance = 5000.0, idRetained = true,
+            activeItems = listOf(ActiveItemLine(2, "Scaffolding set", "2026-11-18"), ActiveItemLine(1, "Plate compactor", null)),
+            overdueDays = 2, invoiceCount = 6, rentalDates = "02 Nov – 14 Nov", lastPayment = "LKR 10,000 · 05 Nov · Cash",
+            lastReview = null, phoneDisplay = "+94 77 123 4567"
+        )
+        if (!Settings.canDrawOverlays(appContext)) return
+        mainHandler.post {
+            showCard(appContext, store, data, FooterInfo(PhoneStrings.get(language, "footer_live"), false), false, "full", language, data.name, "")
+        }
+    }
+
+    private fun buildCardData(brief: BriefEntity?, contact: ContactIndexEntity?, phoneDisplay: String): CallCardData {
+        if (brief == null) {
+            return CallCardData(
+                isUnknown = true, isPhoneContact = contact != null, name = contact?.displayName ?: "",
+                company = null, rating = null, blacklisted = false, balanceDue = 0.0, hasDues = false,
+                depositBalance = 0.0, idRetained = false, activeItems = emptyList(), overdueDays = 0,
+                invoiceCount = 0, rentalDates = null, lastPayment = null, lastReview = null, phoneDisplay = phoneDisplay
+            )
+        }
+        val today = LocalDate.now(ZoneId.of("Asia/Colombo")).toEpochDay()
+        val items = ArrayList<ActiveItemLine>()
+        var maxOverdue = 0
+        runCatching {
+            val arr = JSONArray(brief.activeItemsJson)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val due = o.optString("due", "").takeIf { it.isNotBlank() && it != "null" }
+                items.add(ActiveItemLine(o.optInt("qty", 1), o.optString("name", ""), due))
+                // Overdue days are worked out now from the due date, so they never go stale on the phone.
+                maxOverdue = maxOf(maxOverdue, CallScreenLogic.overdueDays(due, today))
+            }
+        }
+        val lastPayment = runCatching {
+            brief.lastPaymentJson?.let { raw ->
+                val o = org.json.JSONObject(raw)
+                val amount = if (o.has("amount") && !o.isNull("amount")) "LKR " + String.format(Locale.US, "%,.0f", o.optDouble("amount")) + " · " else ""
+                amount + listOf(o.optString("date", ""), o.optString("method", "")).filter { it.isNotBlank() && it != "null" }.joinToString(" · ")
+            }
+        }.getOrNull()
+        val dates = listOfNotNull(brief.firstRental, brief.lastRental).joinToString(" – ").ifBlank { null }
+        return CallCardData(
+            isUnknown = false, isPhoneContact = false, name = brief.displayName, company = brief.companyName,
+            rating = brief.rating, blacklisted = brief.status == "Blacklisted", balanceDue = brief.balanceDue,
+            hasDues = brief.hasDues, depositBalance = brief.depositBalance, idRetained = brief.idRetained,
+            activeItems = items, overdueDays = maxOverdue, invoiceCount = brief.invoiceCount, rentalDates = dates,
+            lastPayment = lastPayment, lastReview = brief.lastReviewComment, phoneDisplay = phoneDisplay
+        )
+    }
+
+    /** Footer: Live (server answered during this call), Synced N min ago, or Offline with the data's date. */
+    private fun footerFor(context: Context, store: CredentialStore, brief: BriefEntity?, live: Boolean, language: String): FooterInfo? {
+        val mode = store.getSyncFooterMode()
+        if (mode == "never") return null
+        if (live) return if (mode == "only_when_stale") null else FooterInfo(PhoneStrings.get(language, "footer_live"), false)
+        // The phone's last completed sync is when it last confirmed its data with the server.
+        val syncedAt = store.getBriefsSyncedAt() ?: brief?.syncedAt ?: return null
+        val instant = runCatching { Instant.parse(syncedAt) }.getOrNull() ?: return null
+        val ageMinutes = Duration.between(instant, Instant.now()).toMinutes().coerceAtLeast(0)
+        val stale = ageMinutes > store.getSyncStaleAfterMinutes()
+        return when {
+            stale -> {
+                val whenText = java.time.format.DateTimeFormatter.ofPattern("HH:mm, d MMM", Locale.ENGLISH)
+                    .format(instant.atZone(ZoneId.of("Asia/Colombo")))
+                FooterInfo(PhoneStrings.format(language, "footer_offline", whenText), true)
+            }
+            mode == "only_when_stale" -> null
+            else -> FooterInfo(PhoneStrings.format(language, "footer_synced", ageMinutes.toInt()), false)
+        }
+    }
+
+    data class FooterInfo(val text: String, val warning: Boolean)
 
     private fun computeLiveSummaryLine(brief: BriefEntity): String {
         val base = brief.summaryLine.trim()
@@ -476,159 +532,69 @@ object CallerOverlayManager {
         }
     }
 
-    private fun showWindowOverlay(
+    private var cachedTokens: CallTokens? = null
+
+    private fun loadTokens(context: Context): CallTokens =
+        cachedTokens ?: context.assets.open("callScreenTokens.json").bufferedReader().use { CallTokens.parse(it.readText()) }
+            .also { cachedTokens = it }
+
+    private fun showCard(
         context: Context,
-        title: String,
-        phoneDisplay: String,
-        subtitle: String,
-        ratingText: String?,
-        isBlacklisted: Boolean,
-        position: String = "top",
-        autoDismissSeconds: Int = 0,
-        syncFooter: String = "",
-        textScale: Float = 1f
+        store: CredentialStore,
+        data: CallCardData,
+        footer: FooterInfo?,
+        locked: Boolean,
+        lockMode: String,
+        language: String,
+        fallbackTitle: String,
+        fallbackSubtitle: String,
+        warn: Boolean = false
     ) {
         val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
         removeOverlayLocked(context)
 
-        val dp = { v: Int ->
-            TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP,
-                v.toFloat(),
-                context.resources.displayMetrics
-            ).toInt()
+        val tokens = runCatching { loadTokens(context) }.getOrNull()
+        if (tokens == null) {
+            showFallbackNotification(context, fallbackTitle, fallbackSubtitle, data.blacklisted)
+            return
         }
+        val parsed = CallDesignParser.parse(store.getCallDesignJson())
+        val design = parsed.design
+        val metrics = context.resources.displayMetrics
+        val density = metrics.density
+        fun dp(v: Int) = (v * density).toInt()
 
-        val root = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            val accentColor = if (isBlacklisted) Color.parseColor("#DC2626") else Color.parseColor("#F59E0B")
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#0F172A"))
-                cornerRadius = dp(14).toFloat()
-                setStroke(dp(2), accentColor)
-            }
-            elevation = dp(10).toFloat()
-            clipToOutline = true
-        }
+        // Phone choice (within the shop's bounds) over the design's scale. SP text already follows the system
+        // font, so when the shop does not respect it the scale is divided back out.
+        val fontScale = context.resources.configuration.fontScale.takeIf { it > 0f } ?: 1f
+        val chosen = CallScreenLogic.effectiveScale(
+            design.textScale, store.getPhoneCallTextScale(), store.getAllowPhoneTextScale(),
+            store.getCallScaleMin(), store.getCallScaleMax(), 1f, false
+        )
+        val textScale = if (store.getRespectSystemFont()) chosen else chosen / fontScale
+        val maxHeightPx = (metrics.heightPixels * tokens.maxCardHeightPercent / 100) - dp(150)
 
-        if (isBlacklisted) {
-            val banner = TextView(context).apply {
-                text = "BLACKLISTED CUSTOMER"
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.parseColor("#DC2626"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTypeface(Typeface.DEFAULT_BOLD)
-                setPadding(dp(14), dp(6), dp(14), dp(6))
-            }
-            root.addView(banner)
-        }
+        val rendered = CallScreenRenderer.build(
+            context, design, tokens, data,
+            RenderOptions(
+                language = language, textScale = textScale, locked = locked, lockedMode = lockMode,
+                footerText = footer?.text, footerIsWarning = footer?.warning == true || warn,
+                shopName = store.getShopName(), maxHeightPx = maxHeightPx.coerceAtLeast(dp(120)),
+                onAction = { action -> handleAction(context, action) },
+                onDismiss = { dismiss(context) }
+            )
+        )
 
-        val content = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-        }
-
-        val headerRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val badgeView = TextView(context).apply {
-            text = "GEARGRID CALLER"
-            setTextColor(Color.parseColor("#F59E0B"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTypeface(Typeface.DEFAULT_BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        headerRow.addView(badgeView)
-
-        if (!ratingText.isNullOrBlank()) {
-            val ratingView = TextView(context).apply {
-                text = ratingText
-                setTextColor(Color.parseColor("#FBBF24"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                setTypeface(Typeface.DEFAULT_BOLD)
-                setPadding(dp(8), dp(2), dp(8), dp(2))
-                background = GradientDrawable().apply {
-                    setColor(Color.parseColor("#1E293B"))
-                    cornerRadius = dp(8).toFloat()
-                }
-            }
-            headerRow.addView(ratingView)
-        }
-
-        val closeBtn = TextView(context).apply {
-            text = "✕"
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setPadding(dp(12), dp(2), dp(4), dp(2))
-            setOnClickListener { dismiss(context) }
-        }
-        headerRow.addView(closeBtn)
-        content.addView(headerRow)
-
-        val nameView = TextView(context).apply {
-            text = title
-            setTextColor(Color.parseColor("#F8FAFC"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f * textScale)
-            setTypeface(Typeface.DEFAULT_BOLD)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            setPadding(0, dp(4), 0, 0)
-        }
-        content.addView(nameView)
-
-        if (syncFooter.isNotBlank()) {
-            content.addView(TextView(context).apply {
-                text = syncFooter
-                setTextColor(if (syncFooter.startsWith("Offline")) Color.parseColor("#FBBF24") else Color.parseColor("#94A3B8"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f * textScale)
-                setPadding(0, dp(4), 0, 0)
-            })
-        }
-
-        val phoneView = TextView(context).apply {
-            text = phoneDisplay
-            setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(2), 0, dp(6))
-            visibility = if (phoneDisplay.isBlank()) View.GONE else View.VISIBLE
-        }
-        content.addView(phoneView)
-
-        val summaryView = TextView(context).apply {
-            text = subtitle
-            setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            maxLines = 3
-            ellipsize = TextUtils.TruncateAt.END
-            visibility = if (subtitle.isBlank()) View.GONE else View.VISIBLE
-        }
-        content.addView(summaryView)
-
-        root.addView(content)
-
-        val isBottom = position == "bottom"
+        val margin = if (design.widthMode == "inset") dp(tokens.insetMarginDp) else 0
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            if (isBottom) {
-                setPadding(dp(12), 0, dp(12), dp(28))
-            } else {
-                setPadding(dp(12), dp(36), dp(12), 0)
-            }
-            addView(
-                root,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
+            setPadding(margin, if (design.position == "top") dp(36) else 0, margin, if (design.position == "bottom") dp(28) else 0)
+            addView(rendered.view, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
             WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
-
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -636,19 +602,81 @@ object CallerOverlayManager {
             flags,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = (if (isBottom) Gravity.BOTTOM else Gravity.TOP) or Gravity.CENTER_HORIZONTAL
+            gravity = when (design.position) {
+                "bottom" -> Gravity.BOTTOM
+                "middle" -> Gravity.CENTER_VERTICAL
+                else -> Gravity.TOP
+            } or Gravity.CENTER_HORIZONTAL
         }
+
+        if (design.draggable) attachDrag(rendered.view, container, params, wm)
 
         try {
             wm.addView(container, params)
             overlayView = container
-            if (autoDismissSeconds > 0) {
+            if (rendered.rule.vibrate) vibrateOnce(context)
+            val seconds = if (design.autoDismissSeconds > 0) design.autoDismissSeconds else store.getOverlayAutoDismissSeconds()
+            if (seconds > 0) {
                 val r = Runnable { dismiss(context) }
                 dismissRunnable = r
-                mainHandler.postDelayed(r, autoDismissSeconds.toLong() * 1000L)
+                mainHandler.postDelayed(r, seconds.toLong() * 1000L)
             }
         } catch (_: Exception) {
-            showFallbackNotification(context, title, subtitle, isBlacklisted)
+            showFallbackNotification(context, fallbackTitle, fallbackSubtitle, data.blacklisted)
+        }
+    }
+
+    private fun attachDrag(handle: View, container: View, params: WindowManager.LayoutParams, wm: WindowManager) {
+        var startY = 0f
+        var startParamY = 0
+        handle.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    startY = event.rawY
+                    startParamY = params.y
+                    false
+                }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    val delta = (event.rawY - startY).toInt()
+                    if (kotlin.math.abs(delta) > 12) {
+                        params.y = startParamY + if ((params.gravity and Gravity.BOTTOM) == Gravity.BOTTOM) -delta else delta
+                        runCatching { wm.updateViewLayout(container, params) }
+                        true
+                    } else false
+                }
+                else -> false
+            }
+        }
+    }
+
+    private fun vibrateOnce(context: Context) {
+        runCatching {
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator ?: return
+            vibrator.vibrate(android.os.VibrationEffect.createOneShot(350, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+        }
+    }
+
+    private fun handleAction(context: Context, action: String) {
+        when (action) {
+            "dismiss" -> dismiss(context)
+            "add_note" -> {
+                dismiss(context)
+                CallStateTracker.openAfterCallCardForActiveCall(context)
+            }
+            "open_on_desktop" -> {
+                dismiss(context)
+                CallStateTracker.openActiveCustomerOnDesktop(context)
+            }
+            "open_app" -> {
+                dismiss(context)
+                context.startActivity(Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                })
+            }
+            "call_back_later" -> {
+                dismiss(context)
+                CallStateTracker.openAfterCallCardForActiveCall(context)
+            }
         }
     }
 

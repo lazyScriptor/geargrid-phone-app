@@ -245,7 +245,7 @@ class CallStateTracker : BroadcastReceiver() {
         }
     }
 
-    private suspend fun showAfterCallCardIfReady(
+    internal suspend fun showAfterCallCardIfReady(
         context: Context,
         store: CredentialStore,
         clientCallId: String,
@@ -390,5 +390,36 @@ class CallStateTracker : BroadcastReceiver() {
 
     companion object {
         private const val FALLBACK_LOOKBACK_MS = 10 * 60 * 1000L
+
+        /** "Add note" / "Call back later" on the caller screen: opens the after-call card for the call in progress. */
+        fun openAfterCallCardForActiveCall(context: Context) {
+            val appContext = context.applicationContext
+            val session = ActiveCallSession.peek() ?: return
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    CallStateTracker().showAfterCallCardIfReady(
+                        appContext, CredentialStore(appContext), session.clientCallId, session.rawNumber, session.phoneE164
+                    )
+                }
+            }
+        }
+
+        /** "Open on desktop": tells the paired user's counter to open this customer. */
+        fun openActiveCustomerOnDesktop(context: Context) {
+            val appContext = context.applicationContext
+            val session = ActiveCallSession.peek() ?: return
+            val phone = session.phoneE164 ?: return
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching {
+                    val store = CredentialStore(appContext)
+                    val brief = AppDatabase.getInstance(appContext).briefDao().findBriefByPhone(phone) ?: return@runCatching
+                    val body = JSONObject().apply {
+                        put("customer_id", brief.customerId)
+                        put("call_id", session.clientCallId)
+                    }
+                    DeviceApiClient(store).post("/device/pos/open-customer", body)
+                }
+            }
+        }
     }
 }

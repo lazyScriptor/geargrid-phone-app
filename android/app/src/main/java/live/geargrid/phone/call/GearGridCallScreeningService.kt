@@ -118,7 +118,9 @@ class GearGridCallScreeningService : CallScreeningService() {
                             lastReviewComment = obj.optNullableString("last_review_comment"),
                             summaryLine = obj.optString("summary_line", ""),
                             updatedAt = obj.optString("updated_at", ""),
-                            syncedAt = java.time.Instant.now().toString()
+                            syncedAt = java.time.Instant.now().toString(),
+                            hasDues = obj.optBoolean("has_dues", false),
+                            nicNumber = obj.optNullableString("nic_number")
                         )
                         val phonesJson = obj.optJSONArray("phones") ?: JSONArray()
                         val phoneRows = ArrayList<BriefPhoneEntity>(phonesJson.length())
@@ -132,7 +134,7 @@ class GearGridCallScreeningService : CallScreeningService() {
                         briefDao.upsertBriefs(listOf(freshBrief))
                         if (phoneRows.isNotEmpty()) briefDao.upsertBriefPhones(phoneRows)
                         if (shouldShowOverlay) {
-                            CallerOverlayManager.showBrief(appContext, phoneDisplay, freshBrief, null)
+                            CallerOverlayManager.showBrief(appContext, phoneDisplay, freshBrief, null, live = true)
                         }
                         if (simMatches &&
                             CallPolicyHelper.shouldLogForScope(callLoggingScope, true, false) &&

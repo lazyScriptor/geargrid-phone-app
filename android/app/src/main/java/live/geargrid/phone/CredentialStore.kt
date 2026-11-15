@@ -75,6 +75,12 @@ class CredentialStore(context: Context) {
             .remove(KEY_CALL_TEXT_SCALE)
             .remove(KEY_APP_LANGUAGE)
             .remove(KEY_APP_TEXT_SIZE)
+            .remove(KEY_APP_LOCK)
+            .remove(KEY_FULL_APP_SIGNED_IN)
+            .remove(KEY_BACKGROUNDED_AT)
+            .remove(KEY_CALL_SCREEN_UNSUPPORTED)
+            .remove(KEY_LAST_SYNC_RESULT)
+            .remove(KEY_ALERTS)
             .apply()
     }
 
@@ -174,20 +180,76 @@ class CredentialStore(context: Context) {
         parseDevicePolicy()?.optJSONObject("sync")?.optString("show_sync_footer")
             ?.takeIf { it in listOf("always", "only_when_stale", "never") } ?: "always"
 
-    fun getCallTextScale(): Float {
-        val phoneScale = prefs.getFloat(KEY_CALL_TEXT_SCALE, -1f)
-        val design = parseDevicePolicy()?.optJSONObject("call_screen")?.optDouble("text_scale", 1.0)?.toFloat() ?: 1f
-        val policy = parseDevicePolicy()?.optJSONObject("call_screen_policy")
-        val min = policy?.optDouble("min", 0.8)?.toFloat() ?: 0.8f
-        val max = policy?.optDouble("max", 2.0)?.toFloat() ?: 2f
-        return (if (phoneScale > 0f) phoneScale else design).coerceIn(min, max)
+    /** The design JSON of the phone's brief profile (the "call_screen" object from GET /device/policy). */
+    fun getCallDesignJson(): JSONObject? = parseDevicePolicy()?.optJSONObject("call_screen")
+
+    private fun callScreenPolicy(): JSONObject? = parseDevicePolicy()?.optJSONObject("call_screen_policy")
+
+    fun getAllowPhoneTextScale(): Boolean = callScreenPolicy()?.optBoolean("allow_phone_text_scale", true) ?: true
+    fun getRespectSystemFont(): Boolean = callScreenPolicy()?.optBoolean("respect_system_font", true) ?: true
+    fun getCallScaleMin(): Float = (callScreenPolicy()?.optDouble("min", 0.8) ?: 0.8).toFloat().coerceIn(0.8f, 2f)
+    fun getCallScaleMax(): Float = (callScreenPolicy()?.optDouble("max", 2.0) ?: 2.0).toFloat().coerceIn(0.8f, 2f)
+
+    /** This phone's own text size for the call screen, or null to use the shop's design. */
+    fun getPhoneCallTextScale(): Float? = prefs.getFloat(KEY_CALL_TEXT_SCALE, -1f).takeIf { it > 0f }
+
+    fun setCallTextScale(scale: Float?) {
+        prefs.edit().apply {
+            if (scale == null) remove(KEY_CALL_TEXT_SCALE) else putFloat(KEY_CALL_TEXT_SCALE, scale.coerceIn(0.8f, 2f))
+        }.apply()
     }
 
-    fun setCallTextScale(scale: Float?) { prefs.edit().apply { if (scale == null) remove(KEY_CALL_TEXT_SCALE) else putFloat(KEY_CALL_TEXT_SCALE, scale.coerceIn(0.8f, 2f)) }.apply() }
-    fun getAppLanguage(): String = prefs.getString(KEY_APP_LANGUAGE, "follow_phone") ?: "follow_phone"
+    fun getAppLanguage(): String = prefs.getString(KEY_APP_LANGUAGE, "follow") ?: "follow"
     fun setAppLanguage(language: String) { prefs.edit().putString(KEY_APP_LANGUAGE, language).apply() }
     fun getAppTextSize(): String = prefs.getString(KEY_APP_TEXT_SIZE, "default") ?: "default"
     fun setAppTextSize(size: String) { prefs.edit().putString(KEY_APP_TEXT_SIZE, size).apply() }
+
+    fun isAppLockEnabled(): Boolean = prefs.getBoolean(KEY_APP_LOCK, false) || requireAppLockByShop()
+    fun setAppLockEnabled(enabled: Boolean) { prefs.edit().putBoolean(KEY_APP_LOCK, enabled).apply() }
+
+    private fun fullAppPolicy(): JSONObject? = parseDevicePolicy()?.optJSONObject("full_app")
+    fun requireAppLockByShop(): Boolean = fullAppPolicy()?.optBoolean("require_app_lock", false) ?: false
+    fun getFullAppSessionMinutes(): Int = (fullAppPolicy()?.optInt("session_minutes", 30) ?: 30).coerceIn(1, 1440)
+    fun blockScreenshots(): Boolean = fullAppPolicy()?.optBoolean("block_screenshots", false) ?: false
+
+    fun isFullAppAllowed(): Boolean {
+        val raw = getEffectiveCapabilitiesJson() ?: return true
+        return runCatching { JSONObject(raw).optBoolean("full_app", true) }.getOrDefault(true)
+    }
+
+    /** Whether the web application is signed in inside the WebView, and when the app last went to the background. */
+    fun setFullAppSignedIn(signedIn: Boolean) { prefs.edit().putBoolean(KEY_FULL_APP_SIGNED_IN, signedIn).apply() }
+    fun isFullAppSignedIn(): Boolean = prefs.getBoolean(KEY_FULL_APP_SIGNED_IN, false)
+    fun setBackgroundedAtMs(ms: Long) { prefs.edit().putLong(KEY_BACKGROUNDED_AT, ms).apply() }
+    fun getBackgroundedAtMs(): Long = prefs.getLong(KEY_BACKGROUNDED_AT, 0L)
+
+    /** Set when the phone is suspended or revoked: the application is signed out the next time it is shown. */
+    fun setPendingWebSignOut(value: Boolean) { prefs.edit().putBoolean(KEY_PENDING_WEB_SIGNOUT, value).apply() }
+    fun consumePendingWebSignOut(): Boolean {
+        val pending = prefs.getBoolean(KEY_PENDING_WEB_SIGNOUT, false)
+        if (pending) prefs.edit().remove(KEY_PENDING_WEB_SIGNOUT).apply()
+        return pending
+    }
+
+    fun isCallScreenUnsupported(): Boolean = prefs.getBoolean(KEY_CALL_SCREEN_UNSUPPORTED, false)
+    fun setCallScreenUnsupported(value: Boolean) { prefs.edit().putBoolean(KEY_CALL_SCREEN_UNSUPPORTED, value).apply() }
+
+    fun getLastSyncResultJson(): String? = prefs.getString(KEY_LAST_SYNC_RESULT, null)
+    fun setLastSyncResult(ok: Boolean, updated: Int?, error: String?) {
+        val json = JSONObject().apply {
+            put("ok", ok)
+            if (updated != null) put("updated", updated)
+            if (error != null) put("error", error)
+        }
+        prefs.edit().putString(KEY_LAST_SYNC_RESULT, json.toString()).apply()
+    }
+
+    fun getAlertsJson(): String? = prefs.getString(KEY_ALERTS, null)
+    fun setAlertsJson(json: String?) {
+        prefs.edit().apply { if (json == null) remove(KEY_ALERTS) else putString(KEY_ALERTS, json) }.apply()
+    }
+
+    fun getShopName(): String? = parseDevicePolicy()?.optString("shop_name")?.takeIf { it.isNotBlank() }
 
     fun getUnknownCallerMode(): String =
         parseDevicePolicy()?.optString("unknown_caller")
@@ -436,6 +498,13 @@ class CredentialStore(context: Context) {
         private const val KEY_CALL_TEXT_SCALE = "call_text_scale"
         private const val KEY_APP_LANGUAGE = "app_language"
         private const val KEY_APP_TEXT_SIZE = "app_text_size"
+        private const val KEY_APP_LOCK = "app_lock_enabled"
+        private const val KEY_FULL_APP_SIGNED_IN = "full_app_signed_in"
+        private const val KEY_BACKGROUNDED_AT = "backgrounded_at_ms"
+        private const val KEY_CALL_SCREEN_UNSUPPORTED = "call_screen_unsupported"
+        private const val KEY_LAST_SYNC_RESULT = "last_sync_result"
+        private const val KEY_ALERTS = "alert_history"
+        private const val KEY_PENDING_WEB_SIGNOUT = "pending_web_signout"
         private val DEFAULT_AFTER_CALL_TAGS = listOf(
             "Booking",
             "Payment promise",

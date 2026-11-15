@@ -1,8 +1,19 @@
 package live.geargrid.phone
 
+import android.app.AlertDialog
+import android.app.DownloadManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.view.WindowManager
+import android.webkit.CookieManager
+import android.webkit.URLUtil
+import android.webkit.WebView
+import androidx.activity.OnBackPressedCallback
+import androidx.fragment.app.FragmentActivity
 import com.getcapacitor.BridgeActivity
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
@@ -20,7 +31,86 @@ class MainActivity : BridgeActivity() {
         GearGridMessagingService.ensureNotificationChannels(this)
         registerPlugin(PhoneAssistantPlugin::class.java)
         super.onCreate(savedInstanceState)
+        // The WebView can be inspected from a computer only in debug builds.
+        WebView.setWebContentsDebuggingEnabled((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0)
+        installBackHandler()
+        installDownloads()
         handlePushIntent(intent)
+    }
+
+    /** Back goes back within the app; on the phone Home it asks before leaving. */
+    private fun installBackHandler() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val web = bridge?.webView
+                val path = runCatching { Uri.parse(web?.url ?: "").path.orEmpty().trimEnd('/') }.getOrDefault("")
+                val onHome = path.isEmpty() || path == "/device"
+                if (!onHome && web != null && web.canGoBack()) {
+                    web.goBack()
+                    return
+                }
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(R.string.exit_confirm)
+                    .setPositiveButton(R.string.exit_yes) { _, _ -> finish() }
+                    .setNegativeButton(R.string.exit_no, null)
+                    .show()
+            }
+        })
+    }
+
+    /** Reports, exports and other http(s) downloads go to Android's download manager. */
+    private fun installDownloads() {
+        bridge?.webView?.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            if (!url.startsWith("http")) return@setDownloadListener
+            runCatching {
+                val request = DownloadManager.Request(Uri.parse(url)).apply {
+                    setMimeType(mimeType)
+                    addRequestHeader("User-Agent", userAgent)
+                    CookieManager.getInstance().getCookie(url)?.let { addRequestHeader("Cookie", it) }
+                    setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, URLUtil.guessFileName(url, contentDisposition, mimeType))
+                }
+                (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        CredentialStore(this).setBackgroundedAtMs(System.currentTimeMillis())
+    }
+
+    /**
+     * After time in the background the application signs out (pairing is untouched), and the phone's own
+     * lock is asked again before the application shows. Both only matter while someone is signed in.
+     */
+    private fun enforceFullAppSession(store: CredentialStore) {
+        val backgroundedAt = store.getBackgroundedAtMs()
+        store.setBackgroundedAtMs(0L)
+        if (backgroundedAt <= 0L) return
+        val awayMs = System.currentTimeMillis() - backgroundedAt
+        if (store.consumePendingWebSignOut() || (store.isFullAppSignedIn() && awayMs > store.getFullAppSessionMinutes() * 60_000L)) {
+            signOutFullApp(store)
+            return
+        }
+        val onApplicationPage = runCatching { !Uri.parse(bridge?.webView?.url ?: "").path.orEmpty().startsWith("/device") }.getOrDefault(false)
+        if (store.isFullAppSignedIn() && store.isAppLockEnabled() && onApplicationPage && awayMs > APP_LOCK_GRACE_MS) {
+            AppLock.authenticate(this as FragmentActivity, getString(R.string.app_name)) { ok, _ ->
+                if (!ok) bridge?.webView?.post { bridge?.webView?.loadUrl("${resolveWebOrigin()}/device") }
+            }
+        }
+    }
+
+    private fun signOutFullApp(store: CredentialStore) {
+        store.setFullAppSignedIn(false)
+        val web = bridge?.webView ?: return
+        web.post {
+            CookieManager.getInstance().removeAllCookies(null)
+            web.evaluateJavascript(
+                "try{localStorage.removeItem('geargrid-auth-storage');sessionStorage.clear();}catch(e){}window.location.href='/device';",
+                null
+            )
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -32,6 +122,10 @@ class MainActivity : BridgeActivity() {
     override fun onResume() {
         super.onResume()
         val store = CredentialStore(this)
+        // Optional: the shop can block screenshots of the application.
+        if (store.blockScreenshots()) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        enforceFullAppSession(store)
         if (store.hasCredentials()) {
             BriefSyncWorker.schedulePeriodic(this)
             BriefSyncWorker.enqueueOneShot(this)
@@ -113,5 +207,9 @@ class MainActivity : BridgeActivity() {
             }
         }
         return "https://app.geargrid.live"
+    }
+
+    companion object {
+        private const val APP_LOCK_GRACE_MS = 60_000L
     }
 }

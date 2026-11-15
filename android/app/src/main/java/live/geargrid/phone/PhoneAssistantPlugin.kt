@@ -233,40 +233,177 @@ class PhoneAssistantPlugin : Plugin() {
     }
 
     @PluginMethod
-    fun searchOfflineBriefs(call: PluginCall) {
-        val rawQuery = call.getString("query")?.trim().orEmpty()
-        val limit = (call.getInt("limit") ?: 25).coerceIn(1, 50)
-        if (rawQuery.length < 2) {
-            call.resolve(JSObject().apply { put("briefs", JSArray()) })
-            return
-        }
-        val digits = rawQuery.filter { it.isDigit() }
-        val profile = store.getBriefProfileJson()
-        val showDebt = profile?.optBoolean("show_debt", true) ?: true
-        val showRating = profile?.optBoolean("show_rating", true) ?: true
-        val showCompany = profile?.optBoolean("show_company", true) ?: true
-        val showIdStatus = profile?.optBoolean("show_id_status", true) ?: true
-
+    fun searchCustomers(call: PluginCall) {
+        val query = call.getString("query")?.trim().orEmpty()
+        val limit = (call.getInt("limit") ?: 15).coerceIn(1, 30)
         CoroutineScope(Dispatchers.IO).launch {
-            val dao = AppDatabase.getInstance(context).briefDao()
-            val matches = dao.searchBriefs(rawQuery, digits, limit)
-            val arr = JSArray()
-            for (b in matches) {
-                val phones = dao.getPhonesForCustomer(b.customerId)
-                arr.put(JSObject().apply {
-                    put("customer_id", b.customerId)
-                    put("display_name", b.displayName)
-                    if (showCompany) put("company_name", b.companyName)
-                    if (showRating && b.rating != null) put("rating", b.rating)
-                    put("status", b.status)
-                    if (showDebt) put("balance_due", b.balanceDue)
-                    if (showIdStatus) put("id_retained", b.idRetained)
-                    put("summary_line", b.summaryLine)
-                    put("phones", JSArray().apply { phones.forEach { put(it) } })
+            val result = OfflineSearch.search(context, query, limit)
+            val hits = JSArray()
+            for (h in result.hits) {
+                hits.put(JSObject().apply {
+                    put("kind", h.kind)
+                    put("id", h.id)
+                    put("name", h.name)
+                    h.company?.let { put("company", it) }
+                    h.phone?.let { put("phone", it) }
+                    h.rating?.let { put("rating", it) }
+                    h.status?.let { put("status", it) }
+                    h.summary?.let { put("summary", it) }
+                    put("hasDues", h.hasDues)
                 })
             }
-            call.resolve(JSObject().apply { put("briefs", arr) })
+            call.resolve(JSObject().apply {
+                put("hits", hits)
+                put("cachedBriefs", result.cachedBriefs)
+            })
         }
+    }
+
+    @PluginMethod
+    fun getSyncStatus(call: PluginCall) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val db = AppDatabase.getInstance(context)
+            val cached = db.briefDao().countBriefs()
+            val outbox = db.contactSyncDao().countOutbox()
+            call.resolve(JSObject().apply {
+                put("lastBriefSyncAt", store.getBriefsSyncedAt())
+                put("lastContactSyncAt", store.getContactsSyncedAt())
+                put("cachedBriefs", cached)
+                put("outboxPending", outbox)
+                put("staleAfterMinutes", store.getSyncStaleAfterMinutes())
+                put("showSyncFooter", store.getSyncFooterMode())
+                put("online", isOnline())
+                store.getLastSyncResultJson()?.let { raw ->
+                    runCatching { put("lastResult", JSObject(raw)) }
+                }
+            })
+        }
+    }
+
+    @PluginMethod
+    fun showSampleCall(call: PluginCall) {
+        val canDraw = Settings.canDrawOverlays(context)
+        if (canDraw) live.geargrid.phone.call.CallerOverlayManager.showSample(context)
+        call.resolve(JSObject().apply { put("shown", canDraw) })
+    }
+
+    @PluginMethod
+    fun setCallTextScale(call: PluginCall) {
+        val scale: Float? = if (call.data.isNull("scale")) null else call.getFloat("scale")
+        store.setCallTextScale(scale)
+        call.resolve(JSObject().apply { put("saved", true) })
+    }
+
+    @PluginMethod
+    fun getAppPrefs(call: PluginCall) {
+        val language = store.getAppLanguage().let { if (it == "en" || it == "si" || it == "ta") it else "follow" }
+        call.resolve(JSObject().apply {
+            put("appLanguage", language)
+            put("appTextSize", store.getAppTextSize())
+            store.getPhoneCallTextScale()?.let { put("callTextScale", it.toDouble()) }
+            put("appLockEnabled", store.isAppLockEnabled())
+            put("appVersion", getAppVersionName())
+        })
+    }
+
+    @PluginMethod
+    fun setAppLanguage(call: PluginCall) {
+        store.setAppLanguage(call.getString("language") ?: "follow")
+        call.resolve(JSObject().apply { put("saved", true) })
+    }
+
+    @PluginMethod
+    fun setAppTextSize(call: PluginCall) {
+        val size = call.getString("size") ?: "default"
+        store.setAppTextSize(if (size in listOf("small", "default", "large", "extra_large")) size else "default")
+        call.resolve(JSObject().apply { put("saved", true) })
+    }
+
+    @PluginMethod
+    fun setAppLock(call: PluginCall) {
+        val enabled = call.getBoolean("enabled") ?: false
+        // A shop that requires the lock cannot be overridden from the phone.
+        store.setAppLockEnabled(enabled || store.requireAppLockByShop())
+        call.resolve(JSObject().apply { put("saved", true) })
+    }
+
+    @PluginMethod
+    fun authenticateAppLock(call: PluginCall) {
+        val act = activity as? androidx.fragment.app.FragmentActivity
+        if (act == null) {
+            call.resolve(JSObject().apply { put("ok", false); put("error", "no_activity") })
+            return
+        }
+        AppLock.authenticate(act, "GearGrid") { ok, error ->
+            call.resolve(JSObject().apply {
+                put("ok", ok)
+                if (error != null) put("error", error)
+            })
+        }
+    }
+
+    @PluginMethod
+    fun setSignedIn(call: PluginCall) {
+        store.setFullAppSignedIn(call.getBoolean("signedIn") ?: false)
+        call.resolve(JSObject().apply { put("saved", true) })
+    }
+
+    @PluginMethod
+    fun sharePdf(call: PluginCall) {
+        val html = call.getString("html").orEmpty()
+        val filename = call.getString("filename") ?: "receipt.pdf"
+        val widthMm = call.getInt("widthMm") ?: 72
+        val act = activity
+        if (html.isBlank() || act == null) {
+            call.resolve(JSObject().apply { put("shared", false); put("error", "empty") })
+            return
+        }
+        PdfShare.share(act, html, filename, widthMm) { shared, error ->
+            call.resolve(JSObject().apply {
+                put("shared", shared)
+                if (error != null) put("error", error)
+            })
+        }
+    }
+
+    @PluginMethod
+    fun listSims(call: PluginCall) {
+        val sims = JSArray()
+        runCatching {
+            val sm = context.getSystemService(android.telephony.SubscriptionManager::class.java)
+            val list = if (hasPerm(Manifest.permission.READ_PHONE_STATE)) sm?.activeSubscriptionInfoList else null
+            list?.forEach { info ->
+                val label = info.displayName?.toString()?.trim().orEmpty().ifBlank { "SIM ${info.simSlotIndex + 1}" }
+                sims.put(JSObject().apply {
+                    put("id", label)
+                    put("label", "$label (SIM ${info.simSlotIndex + 1})")
+                })
+            }
+        }
+        call.resolve(JSObject().apply { put("sims", sims) })
+    }
+
+    @PluginMethod
+    fun getAlerts(call: PluginCall) {
+        val arr = JSArray()
+        val stored = AlertStore.readAll(store)
+        for (i in 0 until stored.length()) {
+            val o = stored.optJSONObject(i) ?: continue
+            arr.put(JSObject(o.toString()))
+        }
+        call.resolve(JSObject().apply { put("alerts", arr) })
+    }
+
+    @PluginMethod
+    fun clearAlerts(call: PluginCall) {
+        AlertStore.clear(store)
+        call.resolve(JSObject().apply { put("cleared", true) })
+    }
+
+    private fun isOnline(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager ?: return false
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork ?: return false) ?: return false
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     @PluginMethod

@@ -40,6 +40,11 @@ object RevocationHandler {
         }
     }
 
+    /** Suspended phones keep their pairing but the signed-in application is signed out. */
+    fun signOutFullApp(context: Context) {
+        runCatching { CredentialStore(context.applicationContext).setPendingWebSignOut(true) }
+    }
+
     private fun wipeFastSync(appContext: Context, keepCredentials: Boolean) {
         runCatching { ContactSyncWorker.cancelPeriodic(appContext) }
         runCatching { BriefSyncWorker.cancelPeriodic(appContext) }
@@ -55,6 +60,13 @@ object RevocationHandler {
         }
         if (!keepCredentials) {
             runCatching { CredentialStore(appContext).clearCredentials() }
+            // A revoked or unpaired phone also loses everything the WebView holds for the application.
+            runCatching {
+                android.os.Handler(Looper.getMainLooper()).post {
+                    android.webkit.CookieManager.getInstance().removeAllCookies(null)
+                    android.webkit.WebStorage.getInstance().deleteAllData()
+                }
+            }
         }
     }
 

@@ -50,6 +50,10 @@ jobs:
             echo "::warning::GOOGLE_SERVICES_JSON_B64 is not set, so this APK has no push notifications."
           fi
 
+      - name: Unit tests
+        working-directory: android
+        run: gradle testDebugUnitTest --stacktrace
+
       - name: Build debug APK
         working-directory: android
         run: gradle assembleDebug --stacktrace

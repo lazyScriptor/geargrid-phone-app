@@ -31,7 +31,10 @@ data class BriefEntity(
     val lastReviewComment: String?,
     val summaryLine: String,
     val updatedAt: String,
-    val syncedAt: String
+    val syncedAt: String,
+    // Release 3: set when the shop's profile sends them. Used for the offline customer search.
+    val hasDues: Boolean = false,
+    val nicNumber: String? = null
 )
 
 @Entity(
@@ -79,6 +82,9 @@ interface ContactSyncDao {
 
     @Query("DELETE FROM contact_state WHERE contactKey IN (:keys)")
     suspend fun deleteStatesByKeys(keys: List<String>)
+
+    @Query("SELECT COUNT(*) FROM outbox")
+    suspend fun countOutbox(): Int
 
     @Query("DELETE FROM contact_state")
     suspend fun clearAllState()
@@ -129,14 +135,27 @@ interface BriefDao {
     @Query("SELECT * FROM contact_index WHERE phoneE164 = :phoneE164 LIMIT 1")
     suspend fun findContactByPhone(phoneE164: String): ContactIndexEntity?
 
+    /**
+     * Offline customer search over the local cache: name, company, NIC, customer ID or phone.
+     * [text] and [nic] are already trimmed; [nic] has spaces removed and is upper case.
+     */
     @Query(
         "SELECT DISTINCT b.* FROM briefs b " +
             "LEFT JOIN brief_phones bp ON bp.customerId = b.customerId " +
-            "WHERE (:query != '' AND (b.displayName LIKE '%' || :query || '%' OR b.companyName LIKE '%' || :query || '%')) " +
+            "WHERE (:text != '' AND (b.displayName LIKE '%' || :text || '%' OR b.companyName LIKE '%' || :text || '%')) " +
+            "OR (:nic != '' AND b.nicNumber IS NOT NULL AND REPLACE(UPPER(b.nicNumber), ' ', '') LIKE '%' || :nic || '%') " +
+            "OR (:id > 0 AND b.customerId = :id) " +
             "OR (:digits != '' AND bp.phoneE164 LIKE '%' || :digits || '%') " +
             "ORDER BY b.displayName ASC LIMIT :limit"
     )
-    suspend fun searchBriefs(query: String, digits: String, limit: Int = 25): List<BriefEntity>
+    suspend fun searchCustomers(text: String, nic: String, id: Long, digits: String, limit: Int = 30): List<BriefEntity>
+
+    /** Synced phone contacts: by phone number only. */
+    @Query("SELECT * FROM contact_index WHERE phoneE164 LIKE '%' || :digits || '%' ORDER BY displayName ASC LIMIT :limit")
+    suspend fun searchContactsByPhone(digits: String, limit: Int = 10): List<ContactIndexEntity>
+
+    @Query("SELECT COUNT(*) FROM briefs")
+    suspend fun countBriefs(): Int
 
     @Query("SELECT phoneE164 FROM brief_phones WHERE customerId = :customerId")
     suspend fun getPhonesForCustomer(customerId: Long): List<String>
