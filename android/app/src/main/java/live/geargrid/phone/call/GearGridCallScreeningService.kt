@@ -117,7 +117,8 @@ class GearGridCallScreeningService : CallScreeningService() {
                             lastPaymentJson = obj.optJSONObject("last_payment")?.toString(),
                             lastReviewComment = obj.optNullableString("last_review_comment"),
                             summaryLine = obj.optString("summary_line", ""),
-                            updatedAt = obj.optString("updated_at", "")
+                            updatedAt = obj.optString("updated_at", ""),
+                            syncedAt = java.time.Instant.now().toString()
                         )
                         val phonesJson = obj.optJSONArray("phones") ?: JSONArray()
                         val phoneRows = ArrayList<BriefPhoneEntity>(phonesJson.length())

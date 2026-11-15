@@ -30,7 +30,8 @@ data class BriefEntity(
     val lastPaymentJson: String?,
     val lastReviewComment: String?,
     val summaryLine: String,
-    val updatedAt: String
+    val updatedAt: String,
+    val syncedAt: String
 )
 
 @Entity(
@@ -156,7 +157,7 @@ interface BriefDao {
         OutboxEntity::class,
         ActiveCallEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {

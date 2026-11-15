@@ -135,7 +135,8 @@ class BriefSyncWorker(
                             lastPaymentJson = lastPaymentJson,
                             lastReviewComment = obj.optNullableString("last_review_comment"),
                             summaryLine = obj.optString("summary_line", ""),
-                            updatedAt = obj.optString("updated_at", "")
+                            updatedAt = obj.optString("updated_at", ""),
+                            syncedAt = data.optString("server_time", java.time.Instant.now().toString())
                         )
                     )
 

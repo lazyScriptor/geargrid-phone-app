@@ -37,6 +37,8 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.temporal.ChronoUnit
 import java.util.Locale
+import java.time.Instant
+import java.time.Duration
 
 object CallerOverlayManager {
     private const val FALLBACK_NOTIFICATION_ID = 9101
@@ -85,6 +87,16 @@ object CallerOverlayManager {
 
         val position = store.getOverlayPosition()
         val autoDismissSeconds = store.getOverlayAutoDismissSeconds()
+        val syncFooter = brief?.syncedAt?.let { syncedAt ->
+            val ageMinutes = runCatching { Duration.between(Instant.parse(syncedAt), Instant.now()).toMinutes().coerceAtLeast(0) }.getOrDefault(0)
+            val stale = ageMinutes > store.getSyncStaleAfterMinutes()
+            when {
+                store.getSyncFooterMode() == "never" -> ""
+                stale -> "Offline · data from ${syncedAt.replace("T", " ").take(16)}"
+                store.getSyncFooterMode() == "only_when_stale" -> ""
+                else -> "Synced $ageMinutes min ago"
+            }
+        } ?: ""
 
         if (Settings.canDrawOverlays(appContext)) {
             mainHandler.post {
@@ -96,7 +108,9 @@ object CallerOverlayManager {
                     visibleRatingText,
                     isBlacklisted,
                     position,
-                    autoDismissSeconds
+                    autoDismissSeconds,
+                    syncFooter,
+                    store.getCallTextScale()
                 )
             }
         } else {
@@ -470,7 +484,9 @@ object CallerOverlayManager {
         ratingText: String?,
         isBlacklisted: Boolean,
         position: String = "top",
-        autoDismissSeconds: Int = 0
+        autoDismissSeconds: Int = 0,
+        syncFooter: String = "",
+        textScale: Float = 1f
     ) {
         val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
         removeOverlayLocked(context)
@@ -554,13 +570,22 @@ object CallerOverlayManager {
         val nameView = TextView(context).apply {
             text = title
             setTextColor(Color.parseColor("#F8FAFC"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f * textScale)
             setTypeface(Typeface.DEFAULT_BOLD)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             setPadding(0, dp(4), 0, 0)
         }
         content.addView(nameView)
+
+        if (syncFooter.isNotBlank()) {
+            content.addView(TextView(context).apply {
+                text = syncFooter
+                setTextColor(if (syncFooter.startsWith("Offline")) Color.parseColor("#FBBF24") else Color.parseColor("#94A3B8"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f * textScale)
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
 
         val phoneView = TextView(context).apply {
             text = phoneDisplay

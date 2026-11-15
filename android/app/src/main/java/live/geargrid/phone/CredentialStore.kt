@@ -72,6 +72,9 @@ class CredentialStore(context: Context) {
             .remove(KEY_AFTER_CALL_DISMISS_SEC)
             .remove(KEY_MIN_APP_VERSION)
             .remove(KEY_LATEST_APP_VERSION)
+            .remove(KEY_CALL_TEXT_SCALE)
+            .remove(KEY_APP_LANGUAGE)
+            .remove(KEY_APP_TEXT_SIZE)
             .apply()
     }
 
@@ -163,6 +166,28 @@ class CredentialStore(context: Context) {
         parseDevicePolicy()?.optJSONObject("overlay")?.optString("show_for")
             ?.takeIf { it == "incoming" || it == "incoming_and_outgoing" }
             ?: "incoming"
+
+    fun getSyncStaleAfterMinutes(): Int =
+        (parseDevicePolicy()?.optJSONObject("sync")?.optInt("stale_after_minutes", 60) ?: 60).coerceIn(1, 10080)
+
+    fun getSyncFooterMode(): String =
+        parseDevicePolicy()?.optJSONObject("sync")?.optString("show_sync_footer")
+            ?.takeIf { it in listOf("always", "only_when_stale", "never") } ?: "always"
+
+    fun getCallTextScale(): Float {
+        val phoneScale = prefs.getFloat(KEY_CALL_TEXT_SCALE, -1f)
+        val design = parseDevicePolicy()?.optJSONObject("call_screen")?.optDouble("text_scale", 1.0)?.toFloat() ?: 1f
+        val policy = parseDevicePolicy()?.optJSONObject("call_screen_policy")
+        val min = policy?.optDouble("min", 0.8)?.toFloat() ?: 0.8f
+        val max = policy?.optDouble("max", 2.0)?.toFloat() ?: 2f
+        return (if (phoneScale > 0f) phoneScale else design).coerceIn(min, max)
+    }
+
+    fun setCallTextScale(scale: Float?) { prefs.edit().apply { if (scale == null) remove(KEY_CALL_TEXT_SCALE) else putFloat(KEY_CALL_TEXT_SCALE, scale.coerceIn(0.8f, 2f)) }.apply() }
+    fun getAppLanguage(): String = prefs.getString(KEY_APP_LANGUAGE, "follow_phone") ?: "follow_phone"
+    fun setAppLanguage(language: String) { prefs.edit().putString(KEY_APP_LANGUAGE, language).apply() }
+    fun getAppTextSize(): String = prefs.getString(KEY_APP_TEXT_SIZE, "default") ?: "default"
+    fun setAppTextSize(size: String) { prefs.edit().putString(KEY_APP_TEXT_SIZE, size).apply() }
 
     fun getUnknownCallerMode(): String =
         parseDevicePolicy()?.optString("unknown_caller")
@@ -408,6 +433,9 @@ class CredentialStore(context: Context) {
         private const val KEY_AFTER_CALL_DISMISS_SEC = "after_call_dismiss_sec"
         private const val KEY_MIN_APP_VERSION = "min_app_version"
         private const val KEY_LATEST_APP_VERSION = "latest_app_version"
+        private const val KEY_CALL_TEXT_SCALE = "call_text_scale"
+        private const val KEY_APP_LANGUAGE = "app_language"
+        private const val KEY_APP_TEXT_SIZE = "app_text_size"
         private val DEFAULT_AFTER_CALL_TAGS = listOf(
             "Booking",
             "Payment promise",
