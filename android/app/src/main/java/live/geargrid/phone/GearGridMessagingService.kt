@@ -54,6 +54,13 @@ class GearGridMessagingService : FirebaseMessagingService() {
 
         val data = message.data
         val type = data["type"].orEmpty()
+        // The push token survives re-pairing, so a revoke or wipe sent for an old pairing can arrive
+        // after the phone paired again. Ignore device-state messages naming a different device id.
+        val targetDeviceId = data["device_id"].orEmpty()
+        val currentDeviceId = CredentialStore(applicationContext).getDeviceId().orEmpty()
+        if (type in DEVICE_STATE_TYPES && targetDeviceId.isNotEmpty() && targetDeviceId != currentDeviceId) {
+            return
+        }
         if (type == "device_revoked") {
             RevocationHandler.wipe(applicationContext, keepCredentials = false)
             return
@@ -166,6 +173,9 @@ class GearGridMessagingService : FirebaseMessagingService() {
     }
 
     companion object {
+        /** Messages that change this phone's pairing state; only obeyed when aimed at this device id. */
+        private val DEVICE_STATE_TYPES = setOf("device_revoked", "device_suspended", "wipe_cache")
+
         const val CHANNEL_BILLS = "bills"
         const val CHANNEL_PAYMENTS = "payments"
         const val CHANNEL_RETURNS = "returns"
