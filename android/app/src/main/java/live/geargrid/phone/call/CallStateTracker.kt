@@ -93,7 +93,14 @@ class CallStateTracker : BroadcastReceiver() {
             TelephonyManager.EXTRA_STATE_IDLE -> {
                 CallerOverlayManager.dismiss(appContext)
                 if (!store.isWithinBusinessHours()) {
-                    ActiveCallSession.consumeOrRestore(appContext)
+                    val outsideHours = goAsync()
+                    CoroutineScope(Dispatchers.IO).launch {
+                        try {
+                            ActiveCallSession.consumeOrRestore(appContext)
+                        } finally {
+                            outsideHours.finish()
+                        }
+                    }
                     return
                 }
                 val endedAtMs = System.currentTimeMillis()
