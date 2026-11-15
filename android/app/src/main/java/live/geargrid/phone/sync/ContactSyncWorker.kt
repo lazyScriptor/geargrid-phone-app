@@ -181,14 +181,15 @@ class ContactSyncWorker(
             while (cursor.moveToNext()) {
                 val contactId = if (idIdx >= 0) cursor.getLong(idIdx) else continue
                 val lookup = if (lookupIdx >= 0) cursor.getString(lookupIdx) else null
-                val key = (lookup?.takeIf { it.isNotBlank() } ?: "cid:$contactId").take(120)
+                val key = contactKeyFor(lookup, contactId)
                 val name = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)?.trim().orEmpty()
+                    .take(MAX_NAME_LENGTH)
                 val rawNum = (if (numIdx >= 0) cursor.getString(numIdx) else null)?.trim().orEmpty()
                 if (name.isEmpty() || rawNum.isEmpty()) continue
 
                 val entry = grouped.getOrPut(key) { name to linkedSetOf() }
                 for (part in PhoneNormalizer.splitPhones(rawNum)) {
-                    if (PhoneNormalizer.normalizeToDigits(part) != null) {
+                    if (part.length <= MAX_PHONE_LENGTH && PhoneNormalizer.normalizeToDigits(part) != null) {
                         entry.second.add(part)
                     }
                 }
@@ -199,11 +200,21 @@ class ContactSyncWorker(
         for ((key, pair) in grouped) {
             val (name, phoneSet) = pair
             if (phoneSet.isEmpty()) continue
-            val sortedPhones = phoneSet.sorted()
+            val sortedPhones = phoneSet.sorted().take(MAX_PHONES_PER_CONTACT)
             val hash = sha256("$name|${sortedPhones.joinToString(",")}")
             out[key] = ScannedContact(key = key, name = name, phones = sortedPhones, hash = hash)
         }
         return out
+    }
+
+    /**
+     * The server accepts keys of at most 64 characters, and one longer key rejects the whole
+     * batch. Android lookup keys (especially Google-synced ones) are often longer, so those
+     * become a stable hash of the lookup key.
+     */
+    private fun contactKeyFor(lookup: String?, contactId: Long): String {
+        val raw = lookup?.takeIf { it.isNotBlank() } ?: return "cid:$contactId"
+        return if (raw.length <= MAX_KEY_LENGTH) raw else "lk:" + sha256(raw).take(40)
     }
 
     private fun sha256(input: String): String {
@@ -213,6 +224,12 @@ class ContactSyncWorker(
 
     companion object {
         private const val CHUNK_SIZE = 500
+
+        // Limits from ContactSyncUpsertSchema in @geargrid/contracts.
+        private const val MAX_KEY_LENGTH = 64
+        private const val MAX_NAME_LENGTH = 255
+        private const val MAX_PHONE_LENGTH = 50
+        private const val MAX_PHONES_PER_CONTACT = 20
         private const val UNIQUE_PERIODIC = "geargrid_contact_sync_periodic"
         private const val UNIQUE_ONESHOT = "geargrid_contact_sync_oneshot"
 
