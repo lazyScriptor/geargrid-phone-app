@@ -134,6 +134,13 @@ class MainActivity : BridgeActivity() {
                 ContactSyncWorker.enqueueOneShot(this)
             }
             syncFcmTokenIfAvailable(store)
+            // Permissions granted in Android Settings reach the server the next time the app opens.
+            val versionName = try {
+                packageManager.getPackageInfo(packageName, 0).versionName ?: "1.0.0"
+            } catch (_: Exception) {
+                "1.0.0"
+            }
+            DeviceStateReporter.reportIfChanged(this, versionName)
         }
         handlePushIntent(intent)
     }
