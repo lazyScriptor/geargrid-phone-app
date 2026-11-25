@@ -29,6 +29,7 @@ class OutboxWorker(
 
         val dao = AppDatabase.getInstance(applicationContext).contactSyncDao()
         val api = DeviceApiClient(store)
+        CallRecordingWorker.resumePending(applicationContext, store)
         val now = System.currentTimeMillis()
         val due = dao.getDueOutbox(now)
         if (due.isEmpty()) {
@@ -84,6 +85,7 @@ class OutboxWorker(
     companion object {
         const val KIND_CONTACT_SYNC_CHUNK = "CONTACT_SYNC_CHUNK"
         const val KIND_CALL_EVENT = "CALL_EVENT"
+        const val KIND_CALL_RECORDING = "CALL_RECORDING"
         private const val MAX_ATTEMPTS = 10
         private const val UNIQUE_OUTBOX = "geargrid_sync_outbox"
 
@@ -100,6 +102,7 @@ class OutboxWorker(
 
         fun cancel(context: Context) {
             WorkManager.getInstance(context.applicationContext).cancelUniqueWork(UNIQUE_OUTBOX)
+            CallRecordingWorker.cancelAll(context)
         }
     }
 }

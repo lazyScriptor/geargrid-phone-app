@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import live.geargrid.phone.api.DeviceApiClient
+import live.geargrid.phone.call.CallRecordingMedia
 import live.geargrid.phone.db.AppDatabase
 import live.geargrid.phone.sync.BriefSyncWorker
 import live.geargrid.phone.sync.ContactSyncWorker
@@ -38,7 +39,9 @@ import org.json.JSONObject
     permissions = [
         Permission(strings = [Manifest.permission.READ_CONTACTS], alias = "contacts"),
         Permission(strings = [Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_PHONE_STATE], alias = "call_log"),
-        Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications")
+        Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications"),
+        Permission(strings = [Manifest.permission.READ_MEDIA_AUDIO], alias = "audio"),
+        Permission(strings = [Manifest.permission.READ_EXTERNAL_STORAGE], alias = "storage_audio")
     ]
 )
 class PhoneAssistantPlugin : Plugin() {
@@ -158,6 +161,16 @@ class PhoneAssistantPlugin : Plugin() {
     @PluginMethod
     fun requestCallLogPermission(call: PluginCall) {
         requestPermissionForAlias("call_log", call, "onPermissionResult")
+    }
+
+    @PluginMethod
+    fun requestAudioPermission(call: PluginCall) {
+        if (CallRecordingMedia.hasPermission(context)) {
+            call.resolve(buildSetupStatus())
+            return
+        }
+        val alias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) "audio" else "storage_audio"
+        requestPermissionForAlias(alias, call, "onPermissionResult")
     }
 
     @PluginMethod
@@ -511,6 +524,7 @@ class PhoneAssistantPlugin : Plugin() {
         val contactsGranted = hasPerm(Manifest.permission.READ_CONTACTS)
         val callLogGranted =
             hasPerm(Manifest.permission.READ_CALL_LOG) && hasPerm(Manifest.permission.READ_PHONE_STATE)
+        val audioGranted = CallRecordingMedia.hasPermission(context)
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryExempt = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
 
@@ -527,6 +541,9 @@ class PhoneAssistantPlugin : Plugin() {
             put("notificationsPermission", notificationsGranted)
             put("contactsPermission", contactsGranted)
             put("callLogPermission", callLogGranted)
+            put("audioPermission", audioGranted)
+            put("callRecordingEnabled", store.isCallRecordingEnabled())
+            put("callRecordingSetupAllowed", store.canSetUpCallRecording())
             put("batteryOptimizationExempt", batteryExempt)
             put("contactSyncEnabled", store.isContactSyncEnabled())
             put("contactSyncMode", store.getContactSyncMode())
@@ -552,6 +569,7 @@ class PhoneAssistantPlugin : Plugin() {
                 put("notifications_permission", notificationsGranted)
                 put("contacts_permission", contactsGranted)
                 put("call_log_permission", callLogGranted)
+                put("audio_permission", audioGranted)
                 put("battery_optimization_exempt", batteryExempt)
             })
         }
@@ -567,6 +585,7 @@ class PhoneAssistantPlugin : Plugin() {
             put("notifications_permission", status.optBoolean("notificationsPermission", false))
             put("contacts_permission", status.optBoolean("contactsPermission", false))
             put("call_log_permission", status.optBoolean("callLogPermission", false))
+            put("audio_permission", status.optBoolean("audioPermission", false))
             put("battery_optimization_exempt", status.optBoolean("batteryOptimizationExempt", false))
         }
         val res = DeviceApiClient(store).post("/device/register", JSONObject().apply {

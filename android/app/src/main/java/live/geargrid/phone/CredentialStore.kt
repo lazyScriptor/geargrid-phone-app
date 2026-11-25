@@ -154,6 +154,17 @@ class CredentialStore(context: Context) {
     private fun parseDevicePolicy(): JSONObject? =
         getDevicePolicyJson()?.let { runCatching { JSONObject(it) }.getOrNull() }
 
+    // Call recording (shop setting, from the "call_recording" block of GET /device/policy). Off until told otherwise.
+    private fun callRecordingFlag(name: String): Boolean =
+        parseDevicePolicy()?.optJSONObject("call_recording")?.optBoolean(name, false) ?: false
+
+    fun isCallRecordingEnabled(): Boolean = callRecordingFlag("enabled")
+
+    fun isCallRecordingMobileDataAllowed(): Boolean = callRecordingFlag("mobileData")
+
+    /** True when the paired user is an administrator, who may see the recording setup step. */
+    fun canSetUpCallRecording(): Boolean = callRecordingFlag("can_set_up")
+
     fun getLockScreenMode(): String =
         parseDevicePolicy()?.optJSONObject("brief_profile")?.optString("lock_screen")
             ?.takeIf { it in listOf("full", "name_rating", "name_only", "hidden") }

@@ -18,6 +18,7 @@ import live.geargrid.phone.api.DeviceApiClient
 import live.geargrid.phone.db.AppDatabase
 import live.geargrid.phone.db.OutboxEntity
 import live.geargrid.phone.sync.BriefSyncWorker
+import live.geargrid.phone.sync.CallRecordingWorker
 import live.geargrid.phone.sync.OutboxWorker
 import org.json.JSONObject
 import java.time.Instant
@@ -166,6 +167,10 @@ class CallStateTracker : BroadcastReceiver() {
                             }
                             BriefSyncWorker.enqueueOneShot(appContext)
                             OutboxWorker.enqueueOneShot(appContext)
+                            CallRecordingWorker.onCallEnded(
+                                appContext, store, session.clientCallId, session.startedAtMs, endedAtMs,
+                                resolvedRawNumber, callLogInfo?.durationSeconds
+                            )
                         } else {
                             // A-09 call-log fallback when session was lost (e.g. OEM killed process).
                             val lookbackStartMs = endedAtMs - FALLBACK_LOOKBACK_MS
@@ -229,6 +234,11 @@ class CallStateTracker : BroadcastReceiver() {
                             }
                             BriefSyncWorker.enqueueOneShot(appContext)
                             OutboxWorker.enqueueOneShot(appContext)
+                            // endedAtMs, not the call record's start + talk time: that leaves out the ringing.
+                            CallRecordingWorker.onCallEnded(
+                                appContext, store, dedupKey, fallbackEntry.dateMs, endedAtMs,
+                                fallbackEntry.number, fallbackEntry.durationSeconds
+                            )
                         }
                     } finally {
                         pendingResult.finish()
