@@ -41,7 +41,8 @@ class DeviceApiClient(private val store: CredentialStore) {
         if (System.currentTimeMillis() - issuedAt < thirtyDaysMs) return
         try {
             val res = post("/device/token/rotate", JSONObject())
-            val newToken = res.optString("device_token", "").trim()
+            // The server answers { status, data: { device_token } }.
+            val newToken = res.optJSONObject("data")?.optString("device_token", "")?.trim().orEmpty()
             if (newToken.isNotEmpty()) {
                 store.updateToken(newToken)
             }
