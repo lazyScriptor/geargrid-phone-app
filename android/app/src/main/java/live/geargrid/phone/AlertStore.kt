@@ -15,7 +15,8 @@ object AlertStore {
         body: String,
         group: String,
         eventKey: String?,
-        invoiceId: String?
+        invoiceId: String?,
+        eventId: String? = null
     ) {
         val current = readAll(store)
         val entry = JSONObject().apply {
@@ -26,6 +27,7 @@ object AlertStore {
             put("group", groupFor(group))
             if (!eventKey.isNullOrBlank()) put("eventKey", eventKey)
             if (!invoiceId.isNullOrBlank()) put("invoiceId", invoiceId)
+            if (!eventId.isNullOrBlank()) put("eventId", eventId)
         }
         val next = JSONArray()
         next.put(entry)

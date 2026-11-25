@@ -127,11 +127,14 @@ class GearGridMessagingService : FirebaseMessagingService() {
             ?: return
         val silent = data["silent"] == "true"
         val invoiceId = data["invoice_id"].orEmpty()
+        val eventId = data["event_id"]?.trim()?.takeIf { it.isNotEmpty() }
+            ?: data["activity_event_id"]?.trim().orEmpty()
 
         val launchIntent = Intent(applicationContext, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             if (type.isNotEmpty()) putExtra(EXTRA_PUSH_TYPE, type)
             if (invoiceId.isNotEmpty()) putExtra(EXTRA_INVOICE_ID, invoiceId)
+            if (eventId.isNotEmpty()) putExtra(EXTRA_EVENT_ID, eventId)
         }
 
         val requestCode = invoiceId.toIntOrNull() ?: (System.currentTimeMillis() and 0x7fffffff).toInt()
@@ -164,7 +167,15 @@ class GearGridMessagingService : FirebaseMessagingService() {
             )
 
         runCatching {
-            AlertStore.add(CredentialStore(applicationContext), title, body, channelId, type.ifBlank { null }, invoiceId.ifBlank { null })
+            AlertStore.add(
+                CredentialStore(applicationContext),
+                title,
+                body,
+                channelId,
+                type.ifBlank { null },
+                invoiceId.ifBlank { null },
+                eventId.ifBlank { null }
+            )
         }
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
             ?: return
@@ -186,6 +197,7 @@ class GearGridMessagingService : FirebaseMessagingService() {
         const val CHANNEL_CALLS = "calls"
         const val EXTRA_PUSH_TYPE = "type"
         const val EXTRA_INVOICE_ID = "invoice_id"
+        const val EXTRA_EVENT_ID = "event_id"
 
         private val KNOWN_ALERT_CHANNELS = setOf(
             CHANNEL_BILLS,

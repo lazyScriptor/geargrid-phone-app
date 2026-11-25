@@ -5,7 +5,7 @@ const config: CapacitorConfig = {
   appName: 'GearGrid Phone',
   webDir: 'dist',
   server: {
-    url: 'https://app.geargrid.live/device',
+    url: 'https://app.geargrid.live/device/alerts',
     cleartext: false,
     allowNavigation: ['app.geargrid.live', 'api.geargrid.live'],
   },

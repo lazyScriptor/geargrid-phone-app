@@ -349,6 +349,14 @@ class PhoneAssistantPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun setStatusBarTheme(call: PluginCall) {
+        val dark = call.getBoolean("dark") ?: false
+        val color = call.getString("color")
+        (activity as? MainActivity)?.applyStatusBarTheme(dark, color)
+        call.resolve(JSObject().apply { put("applied", true) })
+    }
+
+    @PluginMethod
     fun sharePdf(call: PluginCall) {
         val html = call.getString("html").orEmpty()
         val filename = call.getString("filename") ?: "receipt.pdf"
