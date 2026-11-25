@@ -103,12 +103,4 @@ object CallRecordingMedia {
         }
         return names.toList()
     }
-
-    /**
-     * Best effort. Android 11 and later refuse to delete another app's file without asking the user,
-     * and this feature never asks, so there the file stays on the phone.
-     */
-    fun deleteQuietly(context: Context, uri: Uri) {
-        runCatching { context.contentResolver.delete(uri, null, null) }
-    }
 }

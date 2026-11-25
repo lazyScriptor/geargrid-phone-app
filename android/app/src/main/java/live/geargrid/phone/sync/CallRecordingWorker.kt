@@ -125,10 +125,8 @@ class CallRecordingWorker(
             return@withContext Result.retry()
         }
 
+        // The file stays on the phone: Android doesn't let one app silently delete another's recording.
         dao.deleteOutboxById(row.id)
-        if (store.shouldDeleteRecordingAfterUpload()) {
-            CallRecordingMedia.deleteQuietly(applicationContext, uri)
-        }
         Result.success()
     }
 

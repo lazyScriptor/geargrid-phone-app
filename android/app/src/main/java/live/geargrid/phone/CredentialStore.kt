@@ -162,8 +162,6 @@ class CredentialStore(context: Context) {
 
     fun isCallRecordingMobileDataAllowed(): Boolean = callRecordingFlag("mobileData")
 
-    fun shouldDeleteRecordingAfterUpload(): Boolean = callRecordingFlag("deleteFromPhoneAfterUpload")
-
     /** True when the paired user is an administrator, who may see the recording setup step. */
     fun canSetUpCallRecording(): Boolean = callRecordingFlag("can_set_up")
 
