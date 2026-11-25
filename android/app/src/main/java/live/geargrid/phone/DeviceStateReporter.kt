@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import live.geargrid.phone.api.DeviceApiClient
+import live.geargrid.phone.call.CallRecordingMedia
 import org.json.JSONObject
 
 /**
@@ -43,6 +44,7 @@ object DeviceStateReporter {
                 "call_log_permission",
                 has(Manifest.permission.READ_CALL_LOG) && has(Manifest.permission.READ_PHONE_STATE),
             )
+            put("audio_permission", CallRecordingMedia.hasPermission(context))
             put("battery_optimization_exempt", pm?.isIgnoringBatteryOptimizations(context.packageName) == true)
         }
     }

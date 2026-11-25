@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import live.geargrid.phone.api.DeviceApiClient
+import live.geargrid.phone.call.CallRecordingMedia
 import live.geargrid.phone.db.AppDatabase
 import live.geargrid.phone.sync.BriefSyncWorker
 import live.geargrid.phone.sync.ContactSyncWorker
@@ -147,13 +148,8 @@ class PhoneAssistantPlugin : Plugin() {
     }
 
     @PluginMethod
-    fun hasAudioPermission(call: PluginCall) {
-        call.resolve(JSObject().apply { put("granted", hasAudioPerm()) })
-    }
-
-    @PluginMethod
     fun requestAudioPermission(call: PluginCall) {
-        if (hasAudioPerm()) {
+        if (CallRecordingMedia.hasPermission(context)) {
             call.resolve(buildSetupStatus())
             return
         }
@@ -512,7 +508,7 @@ class PhoneAssistantPlugin : Plugin() {
         val contactsGranted = hasPerm(Manifest.permission.READ_CONTACTS)
         val callLogGranted =
             hasPerm(Manifest.permission.READ_CALL_LOG) && hasPerm(Manifest.permission.READ_PHONE_STATE)
-        val audioGranted = hasAudioPerm()
+        val audioGranted = CallRecordingMedia.hasPermission(context)
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryExempt = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
 
@@ -531,6 +527,7 @@ class PhoneAssistantPlugin : Plugin() {
             put("callLogPermission", callLogGranted)
             put("audioPermission", audioGranted)
             put("callRecordingEnabled", store.isCallRecordingEnabled())
+            put("callRecordingSetupAllowed", store.canSetUpCallRecording())
             put("batteryOptimizationExempt", batteryExempt)
             put("contactSyncEnabled", store.isContactSyncEnabled())
             put("contactSyncMode", store.getContactSyncMode())
@@ -596,17 +593,7 @@ class PhoneAssistantPlugin : Plugin() {
         res.optJSONObject("capability_reasons")?.let {
             store.setCapabilityReasonsJson(it.toString())
         }
-        res.optJSONObject("call_recording")?.let {
-            store.setCallRecordingPolicyJson(it.toString())
-        }
     }
-
-    private fun hasAudioPerm(): Boolean =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            hasPerm(Manifest.permission.READ_MEDIA_AUDIO)
-        } else {
-            hasPerm(Manifest.permission.READ_EXTERNAL_STORAGE)
-        }
 
     private fun hasPerm(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED

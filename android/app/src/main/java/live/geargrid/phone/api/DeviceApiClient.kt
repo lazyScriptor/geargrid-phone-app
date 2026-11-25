@@ -2,13 +2,19 @@ package live.geargrid.phone.api
 
 import live.geargrid.phone.CredentialStore
 import live.geargrid.phone.RevocationHandler
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
+import okio.source
 import org.json.JSONObject
 import java.io.IOException
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
 
 class DeviceApiClient(private val store: CredentialStore) {
@@ -131,13 +137,14 @@ class DeviceApiClient(private val store: CredentialStore) {
         }
     }
 
-    fun postMultipartFile(
+    /** Multipart upload that streams the file from [open] instead of holding it in memory. */
+    fun postFile(
         path: String,
         fieldName: String,
         fileName: String,
         mimeType: String,
-        bytes: ByteArray,
-        fields: Map<String, String> = emptyMap()
+        fields: Map<String, String>,
+        open: () -> InputStream
     ): JSONObject {
         val deviceId = store.getDeviceId()
             ?: throw IOException("Device is not paired")
@@ -147,25 +154,30 @@ class DeviceApiClient(private val store: CredentialStore) {
             ?: throw IOException("Tenant DB missing")
 
         val base = store.getApiBaseUrl().trimEnd('/')
-        val mediaType = runCatching { mimeType.toMediaType() }.getOrElse { "audio/mp4".toMediaType() }
-        val multipartBuilder = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart(fieldName, fileName, bytes.toRequestBody(mediaType))
-        for ((k, v) in fields) {
-            multipartBuilder.addFormDataPart(k, v)
+        val fileType = mimeType.toMediaTypeOrNull()
+        val fileBody = object : RequestBody() {
+            override fun contentType(): MediaType? = fileType
+
+            override fun writeTo(sink: BufferedSink) {
+                open().use { sink.writeAll(it.source()) }
+            }
         }
+        val multipart = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(fieldName, fileName, fileBody)
+        fields.forEach { (key, value) -> multipart.addFormDataPart(key, value) }
 
         val request = Request.Builder()
             .url("$base$path")
             .header("x-device-id", deviceId)
             .header("x-tenant-db", tenantDb)
             .header("Authorization", "Bearer $token")
-            .post(multipartBuilder.build())
+            .post(multipart.build())
             .build()
 
         val uploadClient = client.newBuilder()
-            .writeTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(120, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
             .build()
 
         uploadClient.newCall(request).execute().use { response ->

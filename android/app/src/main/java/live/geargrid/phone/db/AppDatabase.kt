@@ -83,7 +83,8 @@ interface ContactSyncDao {
     @Query("DELETE FROM contact_state WHERE contactKey IN (:keys)")
     suspend fun deleteStatesByKeys(keys: List<String>)
 
-    @Query("SELECT COUNT(*) FROM outbox")
+    // Call recordings upload silently, so they never show in the phone's "waiting to upload" count.
+    @Query("SELECT COUNT(*) FROM outbox WHERE kind != 'CALL_RECORDING'")
     suspend fun countOutbox(): Int
 
     @Query("DELETE FROM contact_state")
@@ -99,9 +100,10 @@ interface ContactSyncDao {
     suspend fun clearAllContactIndex()
 
     @Insert
-    suspend fun enqueueOutbox(row: OutboxEntity)
+    suspend fun enqueueOutbox(row: OutboxEntity): Long
 
-    @Query("SELECT * FROM outbox WHERE nextRetryAt <= :nowMs ORDER BY createdAt ASC LIMIT :limit")
+    // CALL_RECORDING rows belong to CallRecordingWorker, which has its own network rule and retries.
+    @Query("SELECT * FROM outbox WHERE nextRetryAt <= :nowMs AND kind != 'CALL_RECORDING' ORDER BY createdAt ASC LIMIT :limit")
     suspend fun getDueOutbox(nowMs: Long, limit: Int = 50): List<OutboxEntity>
 
     @Query("DELETE FROM outbox WHERE id = :id")
@@ -109,6 +111,18 @@ interface ContactSyncDao {
 
     @Query("UPDATE outbox SET attempts = :attempts, nextRetryAt = :nextRetryAt WHERE id = :id")
     suspend fun updateOutboxRetry(id: Long, attempts: Int, nextRetryAt: Long)
+
+    @Query("SELECT * FROM outbox WHERE id = :id")
+    suspend fun getOutboxById(id: Long): OutboxEntity?
+
+    @Query("SELECT * FROM outbox WHERE kind = :kind ORDER BY createdAt ASC")
+    suspend fun getOutboxByKind(kind: String): List<OutboxEntity>
+
+    @Query("UPDATE outbox SET payloadJson = :payloadJson WHERE id = :id")
+    suspend fun updateOutboxPayload(id: Long, payloadJson: String)
+
+    @Query("DELETE FROM outbox WHERE kind = :kind")
+    suspend fun deleteOutboxByKind(kind: String)
 }
 
 @Dao

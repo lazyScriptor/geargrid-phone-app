@@ -18,6 +18,7 @@ import live.geargrid.phone.api.DeviceApiClient
 import live.geargrid.phone.db.AppDatabase
 import live.geargrid.phone.db.OutboxEntity
 import live.geargrid.phone.sync.BriefSyncWorker
+import live.geargrid.phone.sync.CallRecordingWorker
 import live.geargrid.phone.sync.OutboxWorker
 import org.json.JSONObject
 import java.time.Instant
@@ -123,10 +124,8 @@ class CallStateTracker : BroadcastReceiver() {
 
                             val db = AppDatabase.getInstance(appContext)
                             val briefDao = db.briefDao()
-                            val brief = resolvedPhoneE164?.let { briefDao.findBriefByPhone(it) }
-                            val contact = if (brief == null && resolvedPhoneE164 != null) briefDao.findContactByPhone(resolvedPhoneE164) else null
-                            val hasBrief = brief != null
-                            val hasContact = contact != null
+                            val hasBrief = resolvedPhoneE164 != null && briefDao.findBriefByPhone(resolvedPhoneE164) != null
+                            val hasContact = resolvedPhoneE164 != null && briefDao.findContactByPhone(resolvedPhoneE164) != null
                             val isAllowed = session.ringingPosted ||
                                 CallPolicyHelper.shouldLogForScope(loggingScope, hasBrief, hasContact)
                             if (!isAllowed) {
@@ -162,14 +161,9 @@ class CallStateTracker : BroadcastReceiver() {
                             )
                             BriefSyncWorker.enqueueOneShot(appContext)
                             OutboxWorker.enqueueOneShot(appContext)
-                            enqueueCallRecordingIfEnabled(
-                                context = appContext,
-                                store = store,
-                                clientCallId = session.clientCallId,
-                                startedAtMs = session.startedAtMs,
-                                endedAtMs = endedAtMs,
-                                rawNumber = resolvedRawNumber,
-                                contactName = brief?.displayName ?: contact?.displayName
+                            CallRecordingWorker.onCallEnded(
+                                appContext, store, session.clientCallId, session.startedAtMs, endedAtMs,
+                                resolvedRawNumber, callLogInfo?.durationSeconds
                             )
                         } else {
                             // A-09 call-log fallback when session was lost (e.g. OEM killed process).
@@ -185,10 +179,8 @@ class CallStateTracker : BroadcastReceiver() {
                             val phoneE164 = fallbackEntry.number?.let { PhoneNormalizer.normalizeToDigits(it) }
                             val db = AppDatabase.getInstance(appContext)
                             val briefDao = db.briefDao()
-                            val brief = phoneE164?.let { briefDao.findBriefByPhone(it) }
-                            val contact = if (brief == null && phoneE164 != null) briefDao.findContactByPhone(phoneE164) else null
-                            val hasBrief = brief != null
-                            val hasContact = contact != null
+                            val hasBrief = phoneE164 != null && briefDao.findBriefByPhone(phoneE164) != null
+                            val hasContact = phoneE164 != null && briefDao.findContactByPhone(phoneE164) != null
                             if (!CallPolicyHelper.shouldLogForScope(loggingScope, hasBrief, hasContact)) {
                                 return@launch
                             }
@@ -201,11 +193,9 @@ class CallStateTracker : BroadcastReceiver() {
                             prefs.edit().putString("last_key", dedupKey).apply()
 
                             val startedIso = Instant.ofEpochMilli(fallbackEntry.dateMs).toString()
-                            val fallbackEndedMs = max(
-                                fallbackEntry.dateMs,
-                                fallbackEntry.dateMs + fallbackEntry.durationSeconds * 1000L
-                            )
-                            val fallbackEndedIso = Instant.ofEpochMilli(fallbackEndedMs).toString()
+                            val fallbackEndedIso = Instant.ofEpochMilli(
+                                max(fallbackEntry.dateMs, fallbackEntry.dateMs + fallbackEntry.durationSeconds * 1000L)
+                            ).toString()
 
                             val endedBody = JSONObject().apply {
                                 put("client_call_id", dedupKey)
@@ -232,14 +222,10 @@ class CallStateTracker : BroadcastReceiver() {
                             )
                             BriefSyncWorker.enqueueOneShot(appContext)
                             OutboxWorker.enqueueOneShot(appContext)
-                            enqueueCallRecordingIfEnabled(
-                                context = appContext,
-                                store = store,
-                                clientCallId = dedupKey,
-                                startedAtMs = fallbackEntry.dateMs,
-                                endedAtMs = fallbackEndedMs,
-                                rawNumber = fallbackEntry.number,
-                                contactName = brief?.displayName ?: contact?.displayName
+                            // endedAtMs, not the call record's start + talk time: that leaves out the ringing.
+                            CallRecordingWorker.onCallEnded(
+                                appContext, store, dedupKey, fallbackEntry.dateMs, endedAtMs,
+                                fallbackEntry.number, fallbackEntry.durationSeconds
                             )
                         }
                     } finally {
@@ -351,48 +337,6 @@ class CallStateTracker : BroadcastReceiver() {
             )
         )
         OutboxWorker.enqueueOneShot(context)
-    }
-
-    /**
-     * Silently finds a built-in call recording in MediaStore and queues it for background upload.
-     * Never displays any UI, toast, or notification on the phone.
-     */
-    private suspend fun enqueueCallRecordingIfEnabled(
-        context: Context,
-        store: CredentialStore,
-        clientCallId: String,
-        startedAtMs: Long,
-        endedAtMs: Long,
-        rawNumber: String?,
-        contactName: String?
-    ) {
-        if (!store.isCallRecordingEnabled()) return
-        if (!CallRecordingFinder.hasAudioPermission(context)) return
-        runCatching {
-            val match = CallRecordingFinder.findRecording(
-                context = context,
-                startedAtMs = startedAtMs,
-                endedAtMs = endedAtMs,
-                rawNumber = rawNumber,
-                contactName = contactName
-            ) ?: return
-            val payload = JSONObject().apply {
-                put("client_call_id", clientCallId)
-                put("content_uri", match.contentUri)
-                if (!match.filePath.isNullOrBlank()) put("file_path", match.filePath)
-                put("display_name", match.displayName)
-                put("mime_type", match.mimeType)
-                if (match.durationSeconds != null) put("duration_seconds", match.durationSeconds)
-            }
-            AppDatabase.getInstance(context).contactSyncDao().enqueueOutbox(
-                OutboxEntity(
-                    kind = OutboxWorker.KIND_CALL_RECORDING,
-                    payloadJson = payload.toString(),
-                    createdAt = System.currentTimeMillis()
-                )
-            )
-            OutboxWorker.enqueueRecordingUpload(context, store.isCallRecordingMobileDataAllowed())
-        }
     }
 
     private data class CallLogEntry(
