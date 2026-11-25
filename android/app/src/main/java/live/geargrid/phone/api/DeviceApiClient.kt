@@ -3,6 +3,7 @@ package live.geargrid.phone.api
 import live.geargrid.phone.CredentialStore
 import live.geargrid.phone.RevocationHandler
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -122,6 +123,52 @@ class DeviceApiClient(private val store: CredentialStore) {
             .build()
 
         client.newCall(request).execute().use { response ->
+            val raw = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                handleHttpError(response.code, raw)
+            }
+            return if (raw.isBlank()) JSONObject() else JSONObject(raw)
+        }
+    }
+
+    fun postMultipartFile(
+        path: String,
+        fieldName: String,
+        fileName: String,
+        mimeType: String,
+        bytes: ByteArray,
+        fields: Map<String, String> = emptyMap()
+    ): JSONObject {
+        val deviceId = store.getDeviceId()
+            ?: throw IOException("Device is not paired")
+        val token = store.getDeviceToken()
+            ?: throw IOException("Device token missing")
+        val tenantDb = store.getTenantDb()
+            ?: throw IOException("Tenant DB missing")
+
+        val base = store.getApiBaseUrl().trimEnd('/')
+        val mediaType = runCatching { mimeType.toMediaType() }.getOrElse { "audio/mp4".toMediaType() }
+        val multipartBuilder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(fieldName, fileName, bytes.toRequestBody(mediaType))
+        for ((k, v) in fields) {
+            multipartBuilder.addFormDataPart(k, v)
+        }
+
+        val request = Request.Builder()
+            .url("$base$path")
+            .header("x-device-id", deviceId)
+            .header("x-tenant-db", tenantDb)
+            .header("Authorization", "Bearer $token")
+            .post(multipartBuilder.build())
+            .build()
+
+        val uploadClient = client.newBuilder()
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+
+        uploadClient.newCall(request).execute().use { response ->
             val raw = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 handleHttpError(response.code, raw)

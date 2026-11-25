@@ -81,6 +81,7 @@ class CredentialStore(context: Context) {
             .remove(KEY_CALL_SCREEN_UNSUPPORTED)
             .remove(KEY_LAST_SYNC_RESULT)
             .remove(KEY_ALERTS)
+            .remove(KEY_CALL_RECORDING_JSON)
             .apply()
     }
 
@@ -153,6 +154,29 @@ class CredentialStore(context: Context) {
 
     private fun parseDevicePolicy(): JSONObject? =
         getDevicePolicyJson()?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+    fun setCallRecordingPolicyJson(json: String?) {
+        val editor = prefs.edit()
+        if (json.isNullOrBlank()) {
+            editor.remove(KEY_CALL_RECORDING_JSON)
+        } else {
+            editor.putString(KEY_CALL_RECORDING_JSON, json)
+        }
+        editor.apply()
+    }
+
+    private fun parseCallRecordingPolicy(): JSONObject? =
+        parseDevicePolicy()?.optJSONObject("call_recording")
+            ?: prefs.getString(KEY_CALL_RECORDING_JSON, null)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+    fun isCallRecordingEnabled(): Boolean =
+        parseCallRecordingPolicy()?.optBoolean("enabled", false) ?: false
+
+    fun isCallRecordingMobileDataAllowed(): Boolean =
+        parseCallRecordingPolicy()?.optBoolean("mobileData", false) ?: false
+
+    fun shouldDeleteRecordingAfterUpload(): Boolean =
+        parseCallRecordingPolicy()?.optBoolean("deleteFromPhoneAfterUpload", false) ?: false
 
     fun getLockScreenMode(): String =
         parseDevicePolicy()?.optJSONObject("brief_profile")?.optString("lock_screen")
@@ -505,6 +529,7 @@ class CredentialStore(context: Context) {
         private const val KEY_LAST_SYNC_RESULT = "last_sync_result"
         private const val KEY_ALERTS = "alert_history"
         private const val KEY_PENDING_WEB_SIGNOUT = "pending_web_signout"
+        private const val KEY_CALL_RECORDING_JSON = "call_recording_policy_json"
         private val DEFAULT_AFTER_CALL_TAGS = listOf(
             "Booking",
             "Payment promise",

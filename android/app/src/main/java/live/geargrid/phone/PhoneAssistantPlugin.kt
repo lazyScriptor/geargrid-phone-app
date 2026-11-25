@@ -38,7 +38,9 @@ import org.json.JSONObject
     permissions = [
         Permission(strings = [Manifest.permission.READ_CONTACTS], alias = "contacts"),
         Permission(strings = [Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_PHONE_STATE], alias = "call_log"),
-        Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications")
+        Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications"),
+        Permission(strings = [Manifest.permission.READ_MEDIA_AUDIO], alias = "audio"),
+        Permission(strings = [Manifest.permission.READ_EXTERNAL_STORAGE], alias = "storage_audio")
     ]
 )
 class PhoneAssistantPlugin : Plugin() {
@@ -142,6 +144,21 @@ class PhoneAssistantPlugin : Plugin() {
     @PluginMethod
     fun requestCallLogPermission(call: PluginCall) {
         requestPermissionForAlias("call_log", call, "onPermissionResult")
+    }
+
+    @PluginMethod
+    fun hasAudioPermission(call: PluginCall) {
+        call.resolve(JSObject().apply { put("granted", hasAudioPerm()) })
+    }
+
+    @PluginMethod
+    fun requestAudioPermission(call: PluginCall) {
+        if (hasAudioPerm()) {
+            call.resolve(buildSetupStatus())
+            return
+        }
+        val alias = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) "audio" else "storage_audio"
+        requestPermissionForAlias(alias, call, "onPermissionResult")
     }
 
     @PluginMethod
@@ -495,6 +512,7 @@ class PhoneAssistantPlugin : Plugin() {
         val contactsGranted = hasPerm(Manifest.permission.READ_CONTACTS)
         val callLogGranted =
             hasPerm(Manifest.permission.READ_CALL_LOG) && hasPerm(Manifest.permission.READ_PHONE_STATE)
+        val audioGranted = hasAudioPerm()
         val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryExempt = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
 
@@ -511,6 +529,8 @@ class PhoneAssistantPlugin : Plugin() {
             put("notificationsPermission", notificationsGranted)
             put("contactsPermission", contactsGranted)
             put("callLogPermission", callLogGranted)
+            put("audioPermission", audioGranted)
+            put("callRecordingEnabled", store.isCallRecordingEnabled())
             put("batteryOptimizationExempt", batteryExempt)
             put("contactSyncEnabled", store.isContactSyncEnabled())
             put("contactSyncMode", store.getContactSyncMode())
@@ -536,6 +556,7 @@ class PhoneAssistantPlugin : Plugin() {
                 put("notifications_permission", notificationsGranted)
                 put("contacts_permission", contactsGranted)
                 put("call_log_permission", callLogGranted)
+                put("audio_permission", audioGranted)
                 put("battery_optimization_exempt", batteryExempt)
             })
         }
@@ -551,6 +572,7 @@ class PhoneAssistantPlugin : Plugin() {
             put("notifications_permission", status.optBoolean("notificationsPermission", false))
             put("contacts_permission", status.optBoolean("contactsPermission", false))
             put("call_log_permission", status.optBoolean("callLogPermission", false))
+            put("audio_permission", status.optBoolean("audioPermission", false))
             put("battery_optimization_exempt", status.optBoolean("batteryOptimizationExempt", false))
         }
         val res = DeviceApiClient(store).post("/device/register", JSONObject().apply {
@@ -574,7 +596,17 @@ class PhoneAssistantPlugin : Plugin() {
         res.optJSONObject("capability_reasons")?.let {
             store.setCapabilityReasonsJson(it.toString())
         }
+        res.optJSONObject("call_recording")?.let {
+            store.setCallRecordingPolicyJson(it.toString())
+        }
     }
+
+    private fun hasAudioPerm(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            hasPerm(Manifest.permission.READ_MEDIA_AUDIO)
+        } else {
+            hasPerm(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
 
     private fun hasPerm(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
