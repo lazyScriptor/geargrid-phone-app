@@ -5,14 +5,20 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.res.Configuration
+import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.view.View
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.URLUtil
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.fragment.app.FragmentActivity
 import com.getcapacitor.BridgeActivity
 import com.google.firebase.FirebaseApp
@@ -31,6 +37,7 @@ class MainActivity : BridgeActivity() {
         GearGridMessagingService.ensureNotificationChannels(this)
         registerPlugin(PhoneAssistantPlugin::class.java)
         super.onCreate(savedInstanceState)
+        applyWindowInsetsAndInitialStatusBar()
         // The WebView can be inspected from a computer only in debug builds.
         WebView.setWebContentsDebuggingEnabled((applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0)
         installBackHandler()
@@ -38,24 +45,76 @@ class MainActivity : BridgeActivity() {
         handlePushIntent(intent)
     }
 
-    /** Back goes back within the app; on the phone Home it asks before leaving. */
+    /** Pad the WebView container for system bars, camera cut-outs, and the soft keyboard. */
+    private fun applyWindowInsetsAndInitialStatusBar() {
+        val rootView = bridge?.webView?.parent as? View
+        if (rootView != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(rootView) { v, insets ->
+                val bars = insets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() or
+                        WindowInsetsCompat.Type.displayCutout() or
+                        WindowInsetsCompat.Type.ime()
+                )
+                v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+                WindowInsetsCompat.CONSUMED
+            }
+            ViewCompat.requestApplyInsets(rootView)
+        }
+        val systemDark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        applyStatusBarTheme(systemDark, null)
+    }
+
+    /** Match the status bar & root inset background to the active web theme. */
+    fun applyStatusBarTheme(dark: Boolean, colorHex: String? = null) {
+        val fallback = if (dark) "#0F172A" else "#FFFFFF"
+        val bgColor = runCatching { Color.parseColor(colorHex?.takeIf { it.isNotBlank() } ?: fallback) }
+            .getOrElse { Color.parseColor(fallback) }
+        runOnUiThread {
+            (bridge?.webView?.parent as? View)?.setBackgroundColor(bgColor)
+            @Suppress("DEPRECATION")
+            window.statusBarColor = bgColor
+            @Suppress("DEPRECATION")
+            window.navigationBarColor = bgColor
+            WindowCompat.getInsetsController(window, window.decorView)?.apply {
+                isAppearanceLightStatusBars = !dark
+                isAppearanceLightNavigationBars = !dark
+            }
+        }
+    }
+
+    /** Back closes overlays first, steps back in history, returns from full-system root to Alerts, and asks to exit on Alerts. */
     private fun installBackHandler() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 val web = bridge?.webView
-                val path = runCatching { Uri.parse(web?.url ?: "").path.orEmpty().trimEnd('/') }.getOrDefault("")
-                val onHome = path.isEmpty() || path == "/device"
-                if (!onHome && web != null && web.canGoBack()) {
-                    web.goBack()
+                if (web == null) {
+                    showExitDialog()
                     return
                 }
-                AlertDialog.Builder(this@MainActivity)
-                    .setMessage(R.string.exit_confirm)
-                    .setPositiveButton(R.string.exit_yes) { _, _ -> finish() }
-                    .setNegativeButton(R.string.exit_no, null)
-                    .show()
+                web.evaluateJavascript("Boolean(window.__geargridHandleBack && window.__geargridHandleBack())") { result ->
+                    if (result == "true") return@evaluateJavascript
+                    val path = runCatching { Uri.parse(web.url ?: "").path.orEmpty().trimEnd('/') }.getOrDefault("")
+                    val onHome = path.isEmpty() || path == "/device" || path == "/device/alerts"
+                    if (onHome) {
+                        showExitDialog()
+                        return@evaluateJavascript
+                    }
+                    if (web.canGoBack()) {
+                        web.goBack()
+                        return@evaluateJavascript
+                    }
+                    web.loadUrl("${resolveWebOrigin()}/device/alerts")
+                }
             }
         })
+    }
+
+    private fun showExitDialog() {
+        AlertDialog.Builder(this@MainActivity)
+            .setMessage(R.string.exit_confirm)
+            .setPositiveButton(R.string.exit_yes) { _, _ -> finish() }
+            .setNegativeButton(R.string.exit_no, null)
+            .show()
     }
 
     /** Reports, exports and other http(s) downloads go to Android's download manager. */
@@ -96,7 +155,7 @@ class MainActivity : BridgeActivity() {
         val onApplicationPage = runCatching { !Uri.parse(bridge?.webView?.url ?: "").path.orEmpty().startsWith("/device") }.getOrDefault(false)
         if (store.isFullAppSignedIn() && store.isAppLockEnabled() && onApplicationPage && awayMs > APP_LOCK_GRACE_MS) {
             AppLock.authenticate(this as FragmentActivity, getString(R.string.app_name)) { ok, _ ->
-                if (!ok) bridge?.webView?.post { bridge?.webView?.loadUrl("${resolveWebOrigin()}/device") }
+                if (!ok) bridge?.webView?.post { bridge?.webView?.loadUrl("${resolveWebOrigin()}/device/alerts") }
             }
         }
     }
@@ -107,7 +166,7 @@ class MainActivity : BridgeActivity() {
         web.post {
             CookieManager.getInstance().removeAllCookies(null)
             web.evaluateJavascript(
-                "try{localStorage.removeItem('geargrid-auth-storage');sessionStorage.clear();}catch(e){}window.location.href='/device';",
+                "try{localStorage.removeItem('geargrid-auth-storage');sessionStorage.clear();}catch(e){}window.location.href='/device/alerts';",
                 null
             )
         }
@@ -180,20 +239,18 @@ class MainActivity : BridgeActivity() {
 
     private fun handlePushIntent(intent: Intent?) {
         if (intent == null) return
-        val pushType = intent.getStringExtra(GearGridMessagingService.EXTRA_PUSH_TYPE)
         val rawInvoiceId = intent.getStringExtra(GearGridMessagingService.EXTRA_INVOICE_ID)
         val invoiceId = rawInvoiceId?.trim()?.toLongOrNull() ?: return
         if (invoiceId <= 0) return
 
-        if (!pushType.isNullOrBlank() && pushType != "invoice_created" && pushType != "payment_received" && pushType != "return_processed") {
-            return
-        }
-
+        val eventId = intent.getStringExtra(GearGridMessagingService.EXTRA_EVENT_ID)?.trim().orEmpty()
         intent.removeExtra(GearGridMessagingService.EXTRA_INVOICE_ID)
         intent.removeExtra(GearGridMessagingService.EXTRA_PUSH_TYPE)
+        intent.removeExtra(GearGridMessagingService.EXTRA_EVENT_ID)
 
         val origin = resolveWebOrigin()
-        val targetUrl = "$origin/device/invoice/$invoiceId"
+        val query = if (eventId.isNotEmpty()) "?from=${Uri.encode(eventId)}" else ""
+        val targetUrl = "$origin/device/invoice/$invoiceId$query"
         bridge?.webView?.postDelayed({
             bridge?.webView?.loadUrl(targetUrl)
         }, 150)
