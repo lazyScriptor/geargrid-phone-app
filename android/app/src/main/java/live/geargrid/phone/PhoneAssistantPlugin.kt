@@ -92,6 +92,13 @@ class PhoneAssistantPlugin : Plugin() {
         }
     }
 
+    /** The app icon badge follows the feed: with nothing unread, its notifications go away. */
+    @PluginMethod
+    fun syncBadge(call: PluginCall) {
+        if (call.getInt("unread") == 0) NotificationIds.clearFeed(context)
+        call.resolve()
+    }
+
     @PluginMethod
     fun getSetupStatus(call: PluginCall) {
         call.resolve(buildSetupStatus())

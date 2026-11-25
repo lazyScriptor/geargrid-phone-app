@@ -150,14 +150,20 @@ class CallStateTracker : BroadcastReceiver() {
                                 if (!simLabel.isNullOrBlank()) put("sim_label", simLabel.take(40))
                             }
 
-                            postOrEnqueue(appContext, store, endedBody)
-                            showAfterCallCardIfReady(
-                                appContext,
-                                store,
-                                session.clientCallId,
-                                resolvedRawNumber,
-                                resolvedPhoneE164
-                            )
+                            val posted = postOrEnqueue(appContext, store, endedBody)
+                            if (!CallCardLauncher.openIfNeeded(
+                                    appContext, store, posted, endedBody.optString("direction"),
+                                    resolvedRawNumber, resolvedPhoneE164
+                                )
+                            ) {
+                                showAfterCallCardIfReady(
+                                    appContext,
+                                    store,
+                                    session.clientCallId,
+                                    resolvedRawNumber,
+                                    resolvedPhoneE164
+                                )
+                            }
                             BriefSyncWorker.enqueueOneShot(appContext)
                             OutboxWorker.enqueueOneShot(appContext)
                         } else {
@@ -207,14 +213,20 @@ class CallStateTracker : BroadcastReceiver() {
                                 if (!simLabel.isNullOrBlank()) put("sim_label", simLabel.take(40))
                             }
 
-                            postOrEnqueue(appContext, store, endedBody)
-                            showAfterCallCardIfReady(
-                                appContext,
-                                store,
-                                dedupKey,
-                                fallbackEntry.number,
-                                phoneE164
-                            )
+                            val posted = postOrEnqueue(appContext, store, endedBody)
+                            if (!CallCardLauncher.openIfNeeded(
+                                    appContext, store, posted, endedBody.optString("direction"),
+                                    fallbackEntry.number, phoneE164
+                                )
+                            ) {
+                                showAfterCallCardIfReady(
+                                    appContext,
+                                    store,
+                                    dedupKey,
+                                    fallbackEntry.number,
+                                    phoneE164
+                                )
+                            }
                             BriefSyncWorker.enqueueOneShot(appContext)
                             OutboxWorker.enqueueOneShot(appContext)
                         }
@@ -239,10 +251,10 @@ class CallStateTracker : BroadcastReceiver() {
         context: Context,
         store: CredentialStore,
         payload: JSONObject
-    ) {
+    ): JSONObject? {
         val api = DeviceApiClient(store)
         try {
-            api.post("/device/calls", payload)
+            return api.post("/device/calls", payload)
         } catch (e: DeviceApiClient.HttpException) {
             if (e.code !in listOf(400, 401, 403, 409)) {
                 enqueueCallOutbox(context, payload)
@@ -250,6 +262,7 @@ class CallStateTracker : BroadcastReceiver() {
         } catch (_: Exception) {
             enqueueCallOutbox(context, payload)
         }
+        return null
     }
 
     internal suspend fun showAfterCallCardIfReady(

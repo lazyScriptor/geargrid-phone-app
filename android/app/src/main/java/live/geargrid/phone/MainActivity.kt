@@ -27,6 +27,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import live.geargrid.phone.api.DeviceApiClient
+import live.geargrid.phone.call.CallCardLauncher
 import live.geargrid.phone.sync.BriefSyncWorker
 import live.geargrid.phone.sync.ContactSyncWorker
 import live.geargrid.phone.sync.OutboxWorker
@@ -136,6 +137,10 @@ class MainActivity : BridgeActivity() {
 
     override fun onStop() {
         super.onStop()
+        leftOnFullAppPage = runCatching {
+            val path = Uri.parse(bridge?.webView?.url ?: "").path.orEmpty()
+            path.length > 1 && !path.startsWith("/device")
+        }.getOrDefault(false)
         CredentialStore(this).setBackgroundedAtMs(System.currentTimeMillis())
     }
 
@@ -239,6 +244,26 @@ class MainActivity : BridgeActivity() {
 
     private fun handlePushIntent(intent: Intent?) {
         if (intent == null) return
+
+        // Action buttons don't dismiss their notification by themselves.
+        val notificationId = intent.getIntExtra(GearGridMessagingService.EXTRA_NOTIFICATION_ID, -1)
+        if (notificationId != -1) {
+            intent.removeExtra(GearGridMessagingService.EXTRA_NOTIFICATION_ID)
+            NotificationIds.cancelAndTidy(this, notificationId)
+        }
+
+        val callId = intent.getStringExtra(CallCardLauncher.EXTRA_CALL_ID)?.trim().orEmpty()
+        if (callId.isNotEmpty()) {
+            intent.removeExtra(CallCardLauncher.EXTRA_CALL_ID)
+            openPhonePage("/device/call/${Uri.encode(callId)}")
+            return
+        }
+        if (intent.getBooleanExtra(GearGridMessagingService.EXTRA_OPEN_ALERTS, false)) {
+            intent.removeExtra(GearGridMessagingService.EXTRA_OPEN_ALERTS)
+            openPhonePage("/device/alerts")
+            return
+        }
+
         val rawInvoiceId = intent.getStringExtra(GearGridMessagingService.EXTRA_INVOICE_ID)
         val invoiceId = rawInvoiceId?.trim()?.toLongOrNull() ?: return
         if (invoiceId <= 0) return
@@ -248,9 +273,12 @@ class MainActivity : BridgeActivity() {
         intent.removeExtra(GearGridMessagingService.EXTRA_PUSH_TYPE)
         intent.removeExtra(GearGridMessagingService.EXTRA_EVENT_ID)
 
-        val origin = resolveWebOrigin()
         val query = if (eventId.isNotEmpty()) "?from=${Uri.encode(eventId)}" else ""
-        val targetUrl = "$origin/device/invoice/$invoiceId$query"
+        openPhonePage("/device/invoice/$invoiceId$query")
+    }
+
+    private fun openPhonePage(path: String) {
+        val targetUrl = "${resolveWebOrigin()}$path"
         bridge?.webView?.postDelayed({
             bridge?.webView?.loadUrl(targetUrl)
         }, 150)
@@ -274,6 +302,11 @@ class MainActivity : BridgeActivity() {
     }
 
     companion object {
+        /** The app was last left on a full-system page, where somebody may be half way through a bill. */
+        @Volatile
+        var leftOnFullAppPage = false
+            private set
+
         private const val APP_LOCK_GRACE_MS = 60_000L
     }
 }
