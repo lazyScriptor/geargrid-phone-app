@@ -92,6 +92,15 @@ class PhoneAssistantPlugin : Plugin() {
         }
     }
 
+    /** The web pages keep their own copy of the device token, which goes stale when this app rotates it. */
+    @PluginMethod
+    fun getDeviceToken(call: PluginCall) {
+        call.resolve(JSObject().apply {
+            put("deviceId", store.getDeviceId() ?: "")
+            put("deviceToken", store.getDeviceToken() ?: "")
+        })
+    }
+
     /** The app icon badge follows the feed: with nothing unread, its notifications go away. */
     @PluginMethod
     fun syncBadge(call: PluginCall) {
@@ -567,7 +576,7 @@ class PhoneAssistantPlugin : Plugin() {
             if (osVersion.isNotEmpty()) put("os_version", osVersion)
             put("reported_state", reportedState)
             store.getPushToken()?.let { put("push_token", it) }
-        })
+        }).optJSONObject("data") ?: return
         res.optString("device_status", "").trim().takeIf { it.isNotEmpty() }?.let {
             store.setDeviceStatus(it)
         }
